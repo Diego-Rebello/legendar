@@ -1,0 +1,12 @@
+pilot/
+*.mkv
+*.srt
+.cache/
+__pycache__/
+.venv/
+Legendar.app/
+amostra*.md
+chave*.json
+*.tsv
+.env
+.DS_Store
