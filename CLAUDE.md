@@ -32,7 +32,7 @@ Sinais para revisão: falha de validação, velocidade de leitura acima do limit
 - Arrastar o MKV faz um `--dry-run`, sem modelo. Só o clique em Traduzir gasta limite.
 - O app só chama `legendar.py run`, sem lógica própria de legenda. Ele lê as linhas `Extraindo:`, `Trilha`, `Blocos nesta rodada:`, `Progresso:`, `Recusadas:`, `Saída já existe:`, `Traduzindo:`, `Bloco` e `Gerado`, travadas em `test_output_lines_read_by_the_app`.
 - Cancelar só manda SIGTERM ao Python: é `legendar.py` que encerra o `claude` ou o `mkvextract` em andamento.
-- Recusa fica em cache sem tradução e não conta como pronta. Só volta ao modelo com `--retry-refused`, no app o botão Tentar as recusadas.
+- Recusa fica em cache sem tradução e não conta como pronta. Só volta ao modelo com `--retry-refused`, no app o botão Tentar as recusadas, que só aparece quando não há mais blocos inéditos.
 - O percentual da tradução conta legendas prontas, incluindo o cache, e não anda durante uma chamada. A barra geral usa pesos estimados.
 
 ## Chamada do modelo (testada em 2026-11-02)
@@ -58,7 +58,7 @@ Usar `pilot/<episodio>/`, que não vai para o git:
 
 - `en.srt` e `en.tsv`: original (964 legendas).
 - `pt-BR.srt`: tradução de referência, feita à mão com Opus. Boa base, mas não é gabarito.
-- `pt1..4.txt` e `overrides.txt`: entradas de `scripts/build.py`.
+- `pt1..4.txt` e `overrides.txt`: partes de que `pt-BR.srt` foi montado. O script que as juntava saiu do repositório (ver o histórico do git).
 
 Comparar Haiku sozinho, Haiku + Sonnet e Sonnet sozinho com a referência. O usuário avalia uma amostra de 30 legendas. Registrar os tokens de cada variante e adotar o mais simples que mantiver a qualidade.
 

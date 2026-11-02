@@ -48,6 +48,9 @@ final class Job: ObservableObject {
 
     var busy: Bool { phase == .checking || phase == .running }
 
+    // Recusa só volta depois de traduzir o que falta: Traduzir não gasta limite com ela sem pedido.
+    var retrying: Bool { calls == 0 && refused > 0 }
+
     // Pesos estimados: quase todo o tempo passa nas chamadas ao modelo.
     var overallPercent: Int {
         let local = Double(steps[Job.extract].percent + steps[Job.clean].percent) / 2
@@ -79,7 +82,7 @@ final class Job: ObservableObject {
         phase = .checking
         launch(["--dry-run"]) { status in
             if status == 0 {
-                self.phase = .ready(calls: self.refused > 0 ? self.retryCalls : self.calls)
+                self.phase = .ready(calls: self.retrying ? self.retryCalls : self.calls)
             } else {
                 self.fail("Não deu para ler o vídeo: \(self.log.split(separator: "\n").last ?? "sem mensagem")")
             }
@@ -90,8 +93,7 @@ final class Job: ObservableObject {
         generated = nil
         notice = nil
         phase = .running
-        // Sem as recusadas não há SRT: ao confirmar, elas vão junto com o que faltava.
-        let retry = refused > 0
+        let retry = retrying
         begin(calls == 0 && !retry ? Job.write : Job.translate)
         launch(retry ? ["--retry-refused"] : []) { status in
             if let generated = self.generated {
@@ -203,7 +205,7 @@ final class Job: ObservableObject {
         } else if line.hasPrefix("Progresso: ") {
             progress(line)
         } else if line.hasPrefix("Recusadas: ") {
-            // "Recusadas: 100 legendas, 1 chamada(s) para tentar de novo"
+            // "Recusadas: 100 legendas, 1 chamada(s) com --retry-refused"
             let numbers = line.split(separator: " ").compactMap { Int($0) }
             if numbers.count == 2 { (refused, retryCalls) = (numbers[0], numbers[1]) }
         } else if line.hasPrefix("Saída já existe: ") {
@@ -325,11 +327,14 @@ struct ContentView: View {
             EmptyView()
         case .ready(let calls):
             VStack(spacing: 4) {
-                if job.refused > 0 {
+                if job.retrying {
                     Text("O modelo recusou \(job.refused) legendas, e sem elas não há SRT. Tentar de novo: \(calls) chamada(s) ao Sonnet, que gastam limite do plano.")
                         .multilineTextAlignment(.center)
                 } else {
                     Text(calls == 0 ? "Tudo em cache: nenhuma chamada ao modelo." : "Falta confirmar: \(calls) chamada(s) ao Sonnet, que gastam limite do plano.")
+                    if job.refused > 0 {
+                        Text("O modelo recusou \(job.refused) legendas, que ficam para depois: sem elas não há SRT.").foregroundStyle(.orange)
+                    }
                 }
                 if let name = job.existingOutput {
                     Text("Já existe \(name), que será substituído.").foregroundStyle(.orange)
@@ -350,7 +355,7 @@ struct ContentView: View {
             case .checking, .running:
                 Button("Cancelar") { job.cancel() }
             case .ready(let calls):
-                Button(job.refused > 0 ? "Tentar as recusadas" : calls == 0 ? "Gerar SRT" : "Traduzir") { job.start() }
+                Button(job.retrying ? "Tentar as recusadas" : calls == 0 ? "Gerar SRT" : "Traduzir") { job.start() }
                     .keyboardShortcut(.defaultAction)
             case .finished(let url):
                 Button("Mostrar no Finder") { NSWorkspace.shared.activateFileViewerSelecting([url]) }

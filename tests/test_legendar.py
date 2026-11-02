@@ -1,6 +1,6 @@
 """Testes sem gasto de limite: o modelo é sempre simulado e os textos são sintéticos.
 
-Rodar com: python3 -I tests/test_legendar.py
+Rodar com: python3 -I tests/test_legendar.py -b
 """
 import contextlib, importlib.util, io, json, os, signal, stat, subprocess, sys, tempfile, time, unittest
 from pathlib import Path
@@ -118,6 +118,14 @@ class Validation(unittest.TestCase):
         self.assertIn('igual ao original', lg.validate(cue(['Hello there']), ['Hello there']))
         self.assertEqual(lg.validate(cue(['Cubano.']), ['Cubano.']), [])
 
+    def test_repeated_number_must_stay_repeated(self):
+        self.assertIn('número perdido', lg.validate(cue(['5 and 5']), ['só 5']))
+        self.assertNotIn('número perdido', lg.validate(cue(['5']), ['5 e 7']))
+
+    def test_timing_with_position_or_dot(self):
+        for timing in ('00:00:00,000 --> 00:00:10,000 X1:100 X2:200 Y1:1 Y2:2', '00:00:00.000 --> 00:00:10.000'):
+            self.assertEqual(lg.cps(cue(['x'], timing), ['x' * 20]), 2)
+
 
 class StripNonSpeech(unittest.TestCase):
     def check(self, lines, expected):
@@ -127,7 +135,7 @@ class StripNonSpeech(unittest.TestCase):
         for lines in (['[sighs]'], ['- [rain]', '- [thunder]'], ['<i>[sighs]</i>'], ['[humming "A Song', 'by Someone"]'],
                       ['♪ tense music ♪'], ['♪ música de suspense ♪'], ['♪ "A Song"', 'by Someone playing ♪'],
                       ['♪ "Uma Música"', 'de Alguém tocando ♪'], ['♪'], ['- ♪', '- [dialogue inaudible]'],
-                      ['- ♪ somber music', '- [chatter]']):
+                      ['- ♪ somber music', '- [chatter]'], ['(sighs)'], ['<i>(SIGHS)</i>'], ['- (rain)', '- (thunder)'], ['(door', 'closes)']):
             self.check(lines, [])
 
     def test_speaker_names(self):
@@ -135,8 +143,22 @@ class StripNonSpeech(unittest.TestCase):
         self.check(['[Ana] <i>Two lines', 'of text.</i>'], ['<i>Two lines', 'of text.</i>'])
         self.check(['- Excuse me.', '- [officer] Yes?'], ['- Excuse me.', '- Yes?'])
 
+    def test_speaker_names_with_colon(self):
+        self.check(['[Ana]: Hello.'], ['Hello.'])
+        self.check(['- Excuse me.', '- [officer]: Yes?'], ['- Excuse me.', '- Yes?'])
+        self.check(['ANA: Hello.'], ['Hello.'])
+        self.check(['<i>ANA: Hello.</i>'], ['<i>Hello.</i>'])
+        self.check(['- ANA: Hi.', '- MAN #2: Hey.'], ['- Hi.', '- Hey.'])
+        self.check(['ANA (V.O.): Hi.'], ['Hi.'])
+        self.check(['<i>ANA:', 'Hello.</i>'], ['<i>Hello.</i>'])
+
+    def test_colon_inside_speech_stays(self):
+        for lines in (['Meet at 10:30.'], ['Look: a bird.'], ['I said: GO: now.'], ['Your choice :)']):
+            self.check(lines, lines)
+
     def test_effect_inside_dialogue(self):
         self.check(["Can't... [scoffs]", "can't do it."], ["Can't...", "can't do it."])
+        self.check(["Can't... (scoffs)", "can't do it."], ["Can't...", "can't do it."])
 
     def test_lone_dash_goes_away(self):
         self.check(['- [phone chimes]', '- Yo.'], ['Yo.'])
@@ -160,6 +182,9 @@ class StripNonSpeech(unittest.TestCase):
 
     def test_italics_spanning_a_removed_line(self):
         self.check(['<i>[Ana]', 'Hello.</i>'], ['<i>Hello.</i>'])
+        self.check(['<i>[thunder]', '[rain]', 'Hello.</i>'], ['<i>Hello.</i>'])
+        self.check(['<i>Hello.', '[thunder]', '[rain]</i>'], ['<i>Hello.</i>'])
+        self.check(['<i>Hello', '[rain]', 'there.</i>'], ['<i>Hello', 'there.</i>'])
 
 
 class Pipeline(Base):
@@ -242,9 +267,23 @@ class Pipeline(Base):
         video.write_bytes(b'x')
         return video
 
-    def listing(self, code=0):
-        info = {'tracks': [{'id': 2, 'type': 'subtitles', 'properties': {'codec_id': 'S_TEXT/UTF8', 'language': 'eng'}}]}
-        return mock.patch.object(lg.subprocess, 'run', return_value=SimpleNamespace(stdout=json.dumps(info), returncode=code))
+    def listing(self, code=0, names=(None,)):
+        tracks = [{'id': 2 + n, 'type': 'subtitles', 'properties': {'codec_id': 'S_TEXT/UTF8', 'language': 'eng', **({'track_name': name} if name else {})}} for n, name in enumerate(names)]
+        return mock.patch.object(lg.subprocess, 'run', return_value=SimpleNamespace(stdout=json.dumps({'tracks': tracks}), returncode=code))
+
+    def test_full_track_wins_over_forced_signs_and_commentary(self):
+        out = io.StringIO()
+        with self.listing(names=('Forced', 'Signs & Songs', 'Director Commentary', 'SDH', None)), self.fake_mkvextract([], 0) as popen, contextlib.redirect_stdout(out):
+            lg.extract_subtitle(Path('v.mkv'), self.dir / 'x' / 'v.en.srt')
+        self.assertTrue(popen.call_args[0][0][-1].startswith('5:'))
+        lines = out.getvalue().splitlines()
+        self.assertTrue(lines[0].startswith('Trilhas em inglês: 5 (SDH), 6 (sem nome), 2 (Forced)'))
+        self.assertFalse(lines[0].startswith('Trilha '), 'o app marca a etapa por esse prefixo')
+
+    def test_only_forced_track_is_still_used(self):
+        with self.listing(names=('Forced',)), self.fake_mkvextract([], 0) as popen, contextlib.redirect_stdout(io.StringIO()):
+            lg.extract_subtitle(Path('v.mkv'), self.dir / 'x' / 'v.en.srt')
+        self.assertTrue(popen.call_args[0][0][-1].startswith('2:'))
 
     def test_extraction_reports_progress_and_failure(self):
         lines = ['Extracting track 2\n'] + [f'#GUI#progress {i}%\n' for i in range(0, 101)]
@@ -316,13 +355,21 @@ class Pipeline(Base):
         with contextlib.redirect_stdout(out):
             self.assertEqual(self.run_cmd([], dry_run=True), [], 'recusa não volta sozinha')
         self.assertIn('0 em cache', out.getvalue())
-        self.assertIn('Blocos nesta rodada: 0\nProgresso: 0 de 3 legendas\nRecusadas: 3 legendas, 1 chamada(s) para tentar de novo\n', out.getvalue())
+        self.assertIn('Blocos nesta rodada: 0\nProgresso: 0 de 3 legendas\nRecusadas: 3 legendas, 1 chamada(s) com --retry-refused\n', out.getvalue())
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             prompts = self.run_cmd([response('2\tOlá\n3\t<i>Devemos 32.</i>\n4\t<i>Cante.</i>')], retry_refused=True)
         self.assertEqual(len(prompts), 1)
         self.assertRegex(out.getvalue(), r'(?m)^Progresso: 3 de 3 legendas\n')
         self.assertTrue((self.dir / 'video.pt-BR.srt').exists())
+
+    def test_retry_count_ignores_max_blocks(self):
+        self.run_cmd([response('Não posso.', stop='refusal')], block_size=1, max_blocks=1)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.run_cmd([], dry_run=True, block_size=1, max_blocks=1)
+        self.assertIn('Blocos nesta rodada: 1\n', out.getvalue())
+        self.assertIn('Recusadas: 1 legendas, 3 chamada(s) com --retry-refused\n', out.getvalue())
 
     def test_truncated_response_drops_last_line(self):
         self.run_cmd([response('2\tOlá\n3\t<i>Dev', stop='max_tokens')])
@@ -429,6 +476,11 @@ class Effort(Base):
         self.assertNotIn('ANTHROPIC_API_KEY', kw['env'])
         self.assertTrue(list((self.dir / 'raw').glob('*-sonnet-medium.json')))
 
+    def test_missing_input_stops_with_a_message(self):
+        with mock.patch.object(sys, 'argv', ['legendar.py', 'run', str(self.dir / 'nada.srt'), '--effort', 'medium', '--dry-run']):
+            with self.assertRaisesRegex(SystemExit, 'Arquivo não encontrado: .*nada.srt'):
+                lg.main()
+
     def test_required_on_the_command_line(self):
         for argv in (['run', 'x.srt'], ['compare', 'x.srt', 'y.srt'], ['run', 'x.srt', '--effort', 'turbo']):
             with mock.patch.object(sys, 'argv', ['legendar.py'] + argv), mock.patch('sys.stderr'), self.assertRaises(SystemExit):
@@ -515,6 +567,51 @@ class Review(Base):
     def test_needs_translation_first(self):
         with self.assertRaises(SystemExit):
             self.run_cmd([], func=lg.cmd_review, base='haiku:low', by='sonnet:medium', max_blocks=1)
+
+
+class Compare(Base):
+    def setUp(self):
+        super().setUp()
+        self.cues = lg.speech_cues(lg.parse_srt(self.srt))
+        self.store = lg.Store(self.cues, 'haiku', 'high')
+        self.store.put(2, ['Olá,', 'amigo.'])
+        self.store.put(3, ['<i>Devemos muito.</i>'])
+        self.store.put(4, ['<i>Cante.</i>'])
+        self.store.save()
+        self.table = self.dir / 'amostra.md'
+        self.reference = self.dir / 'ref.srt'
+        self.reference.write_text(''.join(f'{c.id}\n{c.timing}\n{text}\n\n' for c, text in zip(self.cues, ('Oi, amigo.', '<i>Devemos 32 dólares.</i>', '<i>Cante.</i>'))), encoding='utf-8')
+
+    def compare(self, reference=None, **kw):
+        args = SimpleNamespace(input=str(self.srt), reference=str(reference or self.reference), model='haiku', effort='high', reviewed_by=None, sample=30, out=str(self.table))
+        vars(args).update(kw)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(lg.cmd_compare(args), 0)
+        return out.getvalue()
+
+    def test_reports_flags_and_writes_the_sample(self):
+        report = self.compare()
+        self.assertIn('3: número perdido: Devemos muito.', report)
+        self.assertIn('- modelo: 1 legendas; referência: 0', report)
+        sheet = self.table.read_text(encoding='utf-8')
+        self.assertIn('| 3 | We owe 32 dollars. | Devemos muito. | Devemos 32 dólares. |', sheet)
+        self.assertNotIn('| 4 |', sheet, 'igual à referência não entra na amostra')
+
+    def test_uses_the_review_when_asked(self):
+        review = lg.Reviewed(self.cues, 'haiku:high', 'sonnet:medium').review
+        review.put(3, ['<i>Devemos 32.</i>'])
+        review.save()
+        report = self.compare(reviewed_by='sonnet:medium')
+        self.assertIn('- modelo: 0 legendas', report)
+
+    def test_stops_when_cleaning_diverges_or_nothing_is_cached(self):
+        reference = self.dir / 'ref.srt'
+        reference.write_text('2\n00:00:04,000 --> 00:00:06,000\nOlá\n', encoding='utf-8')
+        with self.assertRaisesRegex(SystemExit, 'divergiu'):
+            self.compare(reference)
+        with self.assertRaisesRegex(SystemExit, 'Nada em cache'):
+            self.compare(effort='low')
 
 
 class Blind(Base):

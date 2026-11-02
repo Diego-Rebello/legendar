@@ -41,6 +41,10 @@ MUSIC_TAG = re.compile(r'''(?<!<i>)♪\ (?:
     | "[^"♪]*"(?:\ \|\ (?:by|de)\ [^♪|]*?)?
 )(?:\ ♪|(?=\ \||$))''', re.X)
 
+# Início de linha, com "ANA:", "MAN #1:" ou só o ":" que sobra de "[Ana]:". Em maiúsculas e
+# com espaço depois, para não pegar "Look: a bird" nem "10:30".
+SPEAKER_LABEL = re.compile(r"(^|\|)((?:\s|-|<i>)*)(?:[A-Z][A-Z0-9 #.'-]+)?:(?=\s|$)\s*")
+
 SYSTEM_PROMPT = """\
 Você traduz legendas de séries do inglês para o português do Brasil.
 
@@ -117,13 +121,14 @@ def parse_srt(path):
 def strip_non_speech(lines):
     """Tira efeitos, sons, etiquetas de música e nomes. Lista vazia: nada sobrou para mostrar."""
     text = compact(lines)
-    text = re.sub(r'\[[^\]]*\]', '', text)
+    text = re.sub(r'\[[^\]]*\]|\([^)]*\)', '', text)
     text = MUSIC_TAG.sub('', text)
     text = re.sub(r'♪[^♪]*♪', '', text)
     text = re.sub(r'♪[^|]*', '', text)
+    text = SPEAKER_LABEL.sub(r'\1\2', text)
     text = re.sub(r'<i>\s*</i>', '', text)
-    text = re.sub(r'<i>\s*\|\s*', '| <i>', text)
-    text = re.sub(r'\s*\|\s*</i>', '</i> |', text)
+    text = re.sub(r'<i>\s*(?:\|\s*)+', '| <i>', text)
+    text = re.sub(r'(?:\s*\|)+\s*</i>', '</i> |', text)
     kept = []
     for line in expand(text):
         line = re.sub(r'\s+', ' ', line).strip()
@@ -149,9 +154,9 @@ def render_srt(cues, translated):
 
 
 def stamp(s):
-    h, m, r = s.strip().split(':')
-    sec, ms = r.split(',')
-    return int(h) * 3600 + int(m) * 60 + int(sec) + int(ms) / 1000
+    # Só o tempo: um .srt avulso pode trazer posição (X1:100) depois dele e ponto no lugar da vírgula.
+    h, m, sec = s.split()[0].replace(',', '.').split(':')
+    return int(h) * 3600 + int(m) * 60 + float(sec)
 
 
 def cps(cue, lines):
@@ -161,7 +166,7 @@ def cps(cue, lines):
 
 
 def validate(cue, lines):
-    """Regras de scripts/build.py, mais números perdidos e trecho não traduzido."""
+    """Marcas, itálico, tamanho e velocidade, mais números perdidos e trecho não traduzido."""
     flags = []
     s, t = ' '.join(cue.lines), ' '.join(lines)
     for mark in ('<i>', '</i>', '♪', '['):
@@ -175,7 +180,8 @@ def validate(cue, lines):
         flags.append('linha longa')
     if cps(cue, lines) > MAX_CPS:
         flags.append(f'{cps(cue, lines):.0f} cps')
-    if not Counter(re.findall(r'\d+', s)) <= Counter(re.findall(r'\d+', t)):
+    # Subtração, não <=: comparar Counter só existe do Python 3.10 em diante.
+    if Counter(re.findall(r'\d+', s)) - Counter(re.findall(r'\d+', t)):
         flags.append('número perdido')
     if len(s.split()) > 1 and s == t and re.search(r'[A-Za-z]', s):
         flags.append('igual ao original')
@@ -384,9 +390,13 @@ def extract_subtitle(mkv, dest):
     # Arquivo que não é MKV sai com exit 0 e sem a chave tracks.
     tracks = [t for t in info.get('tracks', []) if t['type'] == 'subtitles' and t['properties'].get('codec_id') == 'S_TEXT/UTF8'
               and (t['properties'].get('language_ietf') or t['properties'].get('language', '')).lower().startswith('en')]
-    tracks.sort(key=lambda t: bool(t['properties'].get('forced_track')))
+    # Muitos MKVs só dizem "Forced" no nome, sem a flag. Essas trilhas não trazem o episódio inteiro.
+    tracks.sort(key=lambda t: bool(t['properties'].get('forced_track') or re.search(r'forced|signs|commentary', t['properties'].get('track_name', ''), re.I)))
     if not tracks:
         raise SystemExit(f'{mkv} não tem trilha SRT em inglês')
+    if len(tracks) > 1:
+        listed = ', '.join(f'{t["id"]} ({t["properties"].get("track_name", "sem nome")})' for t in tracks)
+        print(f'Trilhas em inglês: {listed}. Usando a {tracks[0]["id"]}.')
     dest.parent.mkdir(parents=True, exist_ok=True)
     # Só ganha o nome final inteira: read_source reaproveita o que encontrar nele.
     tmp = dest.with_name(dest.name + '.tmp')
@@ -497,7 +507,7 @@ def cmd_run(args):
 
     def to_send(retry_refused):
         left = [c for c in cues if c.id >= args.start and (known(c) is None if retry_refused else store.get(c.id) is None)]
-        return left, [left[n:n + args.block_size] for n in range(0, len(left), args.block_size)][:args.max_blocks]
+        return left, [left[n:n + args.block_size] for n in range(0, len(left), args.block_size)]
 
     def ready():
         return sum(1 for c in cues if known(c) is not None)
@@ -507,12 +517,13 @@ def cmd_run(args):
 
     position = {c.id: n for n, c in enumerate(cues)}
     pending, blocks = to_send(args.retry_refused)
+    blocks = blocks[:args.max_blocks]
     print(f'{len(original)} legendas: {len(original) - len(cues)} só com efeitos ou sons (removidas), {ready()} em cache, {len(pending)} pendentes. Blocos nesta rodada: {len(blocks)}')
     progress()
     # Recusa fica em cache para não gastar de novo sem pedido, mas não conta como pronta.
     refused = sum(1 for c in cues if store.get(c.id) and known(c) is None)
     if refused:
-        print(f'Recusadas: {refused} legendas, {len(to_send(True)[1])} chamada(s) para tentar de novo')
+        print(f'Recusadas: {refused} legendas, {len(to_send(True)[1])} chamada(s) com --retry-refused')
     out = video.with_name(f'{video.stem}.pt-BR.srt')
     if out.exists():
         print(f'Saída já existe: {out}')
@@ -772,7 +783,10 @@ def main():
     u.add_argument('--notes', required=True, help='TSV: id, nota A, nota B, comentário opcional')
     u.set_defaults(func=cmd_unblind)
     args = ap.parse_args()
-    return args.func(args)
+    try:
+        return args.func(args)
+    except FileNotFoundError as e:
+        raise SystemExit(f'Arquivo não encontrado: {e.filename}')
 
 
 if __name__ == '__main__':
