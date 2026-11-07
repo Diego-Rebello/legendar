@@ -86,6 +86,8 @@ Episódio inteiro com `sonnet:medium` (751 legendas, 8 chamadas): cerca de US$ 0
 
 ## Lições da primeira execução
 
+- O Sonnet às vezes junta duas legendas de uma mesma frase e renumera as seguintes, deslocando as traduções em uma posição sem erro aparente. Em 2026-11-07, no s02e02, aconteceu em 2 de 11 blocos (349-452 e 785-893), e o parser antigo pôs os dois desalinhados no cache. Agora a resposta só entra se os IDs baterem exatamente com o bloco, na ordem; senão o bloco volta inteiro, uma vez, na mesma rodada. Respostas antigas podem ser reauditadas pelo `raw/` do cache.
+- O bloco 349-452 errou duas vezes do mesmo jeito: depois de cada ID que faltava por ter sido removido (395, 406, 434, 438), o modelo escrevia esse ID no lugar do seguinte. Ele conta, não copia. Por isso o prompt de tradução numera as falas em sequência (1, 2, 3...) e converte de volta; cache e SRT usam o ID real. Não muda o `SYSTEM_PROMPT` nem a chave do cache. Os números citados em `ID fora do bloco` são os do prompt. A revisão ainda usa os IDs reais.
 - Limite de 22 caracteres por segundo foi escolhido sem medir. 96 legendas ainda passam dele; rever o critério.
 - Ao encurtar, perderam-se detalhes nas legendas 277, 779 e 882.
 - O gênero de alguns personagens não dá para saber só pelo texto; registrar no glossário.

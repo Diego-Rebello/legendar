@@ -30,6 +30,7 @@ MIN_CHARS_FOR_CPS = 15
 SAMPLE_SEED = 20261102
 EFFORTS = ('low', 'medium', 'high', 'xhigh', 'max')
 MODEL_TIMEOUT = 900
+RETRIES = 1  # por bloco, na mesma rodada, quando a resposta não serve
 MKV_OK = (0, 1)  # man mkvextract: 1 é aviso, 2 é erro. Negativo é morte por sinal.
 
 # Em inglês e em português, porque a referência também passa por aqui. Sem <i> antes:
@@ -196,14 +197,26 @@ def review_flags(cue, entry):
     return flags
 
 
-def build_prompt(block, context):
+def numbering(cues):
+    """Número de cada legenda no prompt: a posição entre as falas, a partir de 1.
+
+    Os IDs do SRT ficam com buracos onde havia só efeito ou som, e o modelo conta em vez de
+    copiar: no s02e02, depois de cada buraco, escreveu o ID que faltava (395 no lugar de 396)
+    e o bloco inteiro foi descartado. Em sequência não há buraco para errar. O cache e o SRT
+    continuam com os IDs reais.
+    """
+    position = {c.id: n for n, c in enumerate(cues, 1)}
+    return lambda c: position[c.id]
+
+
+def build_prompt(block, context, number=lambda c: c.id):
     parts = []
     if context:
         parts.append('CONTEXTO')
         for cue, pt in context:
-            parts.append(f'{cue.id}\t{compact(cue.lines)}' + (f' => {compact(pt)}' if pt else ''))
+            parts.append(f'{number(cue)}\t{compact(cue.lines)}' + (f' => {compact(pt)}' if pt else ''))
     parts.append('TRADUZIR')
-    parts += [f'{c.id}\t{compact(c.lines)}' for c in block]
+    parts += [f'{number(c)}\t{compact(c.lines)}' for c in block]
     return '\n'.join(parts)
 
 
@@ -227,20 +240,41 @@ def build_review_prompt(block, context, base):
     return '\n'.join(parts)
 
 
-def parse_response(text, ids):
-    """Devolve ({id: (linhas, dúvida)}, problemas). IDs faltantes voltam na próxima rodada."""
-    wanted, found, problems = set(ids), {}, []
+def parse_response(text, ids, truncated=False):
+    """Devolve ({id: (linhas, dúvida)}, problemas). Vazio quando os IDs não batem com o bloco.
+
+    O modelo às vezes junta duas legendas de uma mesma frase e renumera as seguintes: cada
+    tradução sai com o ID da legenda anterior. Num bloco com IDs não contíguos isso aparece
+    como ID fora do bloco ou repetido; num trecho contíguo, só como um ID faltando. Nos dois
+    casos não dá para saber onde o deslocamento começou, então o bloco inteiro volta.
+    Comentário solto, sem ID, é só ruído.
+    """
+    wanted, found, problems, misaligned = set(ids), {}, [], False
     for raw in text.splitlines():
         line = raw.strip()
         if not line or line.startswith('```') or line in ('TRADUZIR', 'REVISAR', 'CONTEXTO'):
             continue
         m = re.fullmatch(r'(\d+)(\?)?(?:\t| +)(.+)', line)
-        if not m or int(m[1]) not in wanted:
+        if not m:
             problems.append(f'linha inesperada: {line[:80]!r}')
+        elif int(m[1]) not in wanted:
+            problems.append(f'ID fora do bloco: {line[:80]!r}')
+            misaligned = True
         elif int(m[1]) in found:
             problems.append(f'ID repetido na resposta: {m[1]}')
+            misaligned = True
         else:
             found[int(m[1])] = (expand(m[3]), bool(m[2]))
+    # Cortada por max_tokens, basta ser o começo do bloco; a última linha pode estar pela metade.
+    expected = ids[:len(found)] if truncated else list(ids)
+    if list(found) != expected:
+        misaligned = True
+    if truncated and found:
+        found.pop(next(reversed(found)))
+        problems.append('resposta cortada por max_tokens')
+    if misaligned:
+        problems.append('resposta descartada: os IDs não batem com o bloco, e uma legenda fora do lugar desloca as seguintes')
+        return {}, problems
     return found, problems
 
 
@@ -431,11 +465,11 @@ def model_swapped(model, used):
     return not any(model in name for name in used) or any(model not in name and 'haiku' not in name for name in used)
 
 
-def translate_block(block, context, model, effort, store):
-    return ask(build_prompt(block, context), block, model, effort, store, SYSTEM_PROMPT)
+def translate_block(block, context, model, effort, store, number):
+    return ask(build_prompt(block, context, number), block, model, effort, store, SYSTEM_PROMPT, number)
 
 
-def ask(prompt, block, model, effort, store, system):
+def ask(prompt, block, model, effort, store, system, number=lambda c: c.id):
     data = call_model(prompt, model, effort, store.dir / 'raw', system)
     # modelUsage soma todas as requisições da chamada e é o que fecha com total_cost_usd.
     # usage cobre só a principal: no piloto, omitiu 3112 de entrada e 452 de saída.
@@ -463,19 +497,16 @@ def ask(prompt, block, model, effort, store, system):
         store.save()
         return record, ['recusa no bloco inteiro']
 
-    ids = [c.id for c in block]
-    found, problems = parse_response(data.get('result', ''), ids)
-    if data.get('stop_reason') == 'max_tokens' and found:
-        found.pop(max(found))  # a última linha pode estar cortada
-        problems.append('resposta cortada por max_tokens')
+    # Os problemas citam o número do prompt; o cache e o aviso de faltantes, o ID do SRT.
+    found, problems = parse_response(data.get('result', ''), [number(c) for c in block], data.get('stop_reason') == 'max_tokens')
     for c in block:
-        if c.id in found:
-            lines, doubt = found[c.id]
+        if number(c) in found:
+            lines, doubt = found[number(c)]
             store.put(c.id, lines, ['dúvida'] if doubt else [])
     store.save()
-    missing = [i for i in ids if i not in found]
-    if missing:
-        problems.append(f'sem tradução, voltam na próxima rodada: {missing}')
+    missing = [c.id for c in block if number(c) not in found]
+    if found and missing:
+        problems.append(f'sem tradução: {missing}')
     return record, problems
 
 
@@ -516,6 +547,7 @@ def cmd_run(args):
         print(f'Progresso: {ready()} de {len(cues)} legendas')
 
     position = {c.id: n for n, c in enumerate(cues)}
+    number = numbering(cues)
     pending, blocks = to_send(args.retry_refused)
     blocks = blocks[:args.max_blocks]
     print(f'{len(original)} legendas: {len(original) - len(cues)} só com efeitos ou sons (removidas), {ready()} em cache, {len(pending)} pendentes. Blocos nesta rodada: {len(blocks)}')
@@ -529,24 +561,34 @@ def cmd_run(args):
         print(f'Saída já existe: {out}')
     failed = False
     for n, block in enumerate(blocks, 1):
-        start = position[block[0].id]
-        context = [(c, known(c)) for c in cues[max(0, start - CONTEXT_CUES):start]]
         if args.dry_run:
-            prompt = build_prompt(block, context)
+            start = position[block[0].id]
+            prompt = build_prompt(block, [(c, known(c)) for c in cues[max(0, start - CONTEXT_CUES):start]], number)
             print(f'[dry-run] {block[0].id}-{block[-1].id}: {len(block)} legendas, {len(prompt)} caracteres de prompt, {len(SYSTEM_PROMPT)} de sistema')
             continue
-        print(f'Traduzindo: bloco {n} de {len(blocks)}, legendas {block[0].id}-{block[-1].id}')
-        try:
-            record, problems = translate_block(block, context, args.model, args.effort, store)
-        except ModelError as e:
-            # Sem nova tentativa automática: pode ser o limite do plano.
-            print(f'Parado no bloco {block[0].id}-{block[-1].id}: {e}', file=sys.stderr)
-            failed = True
+        # Resposta descartada ou cortada volta uma vez, só com o que ficou sem tradução, para
+        # o SRT sair na mesma rodada. Recusa não volta: fica em cache com o sinal.
+        for attempt in range(1 + RETRIES):
+            start = position[block[0].id]
+            context = [(c, known(c)) for c in cues[max(0, start - CONTEXT_CUES):start]]
+            again = ' (nova tentativa)' if attempt else ''
+            print(f'Traduzindo: bloco {n} de {len(blocks)}{again}, legendas {block[0].id}-{block[-1].id}')
+            try:
+                record, problems = translate_block(block, context, args.model, args.effort, store, number)
+            except ModelError as e:
+                # Erro do claude não tem nova tentativa automática: pode ser o limite do plano.
+                print(f'Parado no bloco {block[0].id}-{block[-1].id}: {e}', file=sys.stderr)
+                failed = True
+                break
+            print(f'Bloco {record["first"]}-{record["last"]}: entrada {record["input_tokens"]} + cache {record["cache_creation_input_tokens"]}/{record["cache_read_input_tokens"]}, saída {record["output_tokens"]}, stop_reason {record["stop_reason"]}')
+            for p in problems:
+                print(' ', p)
+            progress()
+            block = [c for c in block if store.get(c.id) is None]
+            if not block:
+                break
+        if failed:
             break
-        print(f'Bloco {record["first"]}-{record["last"]}: entrada {record["input_tokens"]} + cache {record["cache_creation_input_tokens"]}/{record["cache_read_input_tokens"]}, saída {record["output_tokens"]}, stop_reason {record["stop_reason"]}')
-        for p in problems:
-            print(' ', p)
-        progress()
 
     if not args.dry_run and not failed:
         translated = {c.id: known(c) for c in cues}

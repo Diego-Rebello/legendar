@@ -95,9 +95,29 @@ class Response(unittest.TestCase):
         self.assertEqual(problems, [])
 
     def test_ignores_fences_and_reports_noise(self):
-        found, problems = lg.parse_response('```\n2\tOlá\nAqui está:\n99\tfora do bloco\n2\tde novo\n```', [2])
-        self.assertEqual(found, {2: (['Olá'], False)})
-        self.assertEqual(len(problems), 3)
+        found, problems = lg.parse_response('```\nAqui está:\n2\tOlá\n3\tTchau\n```', [2, 3])
+        self.assertEqual(found, {2: (['Olá'], False), 3: (['Tchau'], False)})
+        self.assertEqual(len(problems), 1)
+
+    def test_merged_cue_shifts_the_rest_and_discards_the_block(self):
+        # Juntou 3 e 4, como a 852 e a 853 do episódio real: 4 recebeu o texto de 5.
+        found, problems = lg.parse_response('2\tum\n3\tdois três\n4\tquatro\n6\tseis', [2, 3, 4, 5, 6])
+        self.assertEqual(found, {})
+        self.assertIn('descartada', problems[-1])
+
+    def test_id_outside_block_or_repeated_discards_the_block(self):
+        # Como o bloco 349-452: ID que só existe numa numeração contínua, e depois uma "correção".
+        for text in ('2\tum\n4\tdois\n5\ttrês', '2\tum\n3\tdois\n5\ttrês\nCorrigindo:\n2\tum\n3\tdois\n5\ttrês'):
+            found, problems = lg.parse_response(text, [2, 3, 5])
+            self.assertEqual(found, {}, text)
+
+    def test_out_of_order_discards_the_block(self):
+        self.assertEqual(lg.parse_response('3\tdois\n2\tum', [2, 3])[0], {})
+
+    def test_truncated_keeps_a_prefix_minus_the_cut_line(self):
+        found, problems = lg.parse_response('2\tum\n3\tdo', [2, 3, 5], truncated=True)
+        self.assertEqual(list(found), [2])
+        self.assertEqual(lg.parse_response('2\tum\n5\tdo', [2, 3, 5], truncated=True)[0], {})
 
 
 class Validation(unittest.TestCase):
@@ -189,7 +209,7 @@ class StripNonSpeech(unittest.TestCase):
 
 class Pipeline(Base):
     def test_effects_never_reach_model_or_output(self):
-        prompts = self.run_cmd([response('2\tOlá, | amigo.\n3\t<i>Devemos 32.</i>\n4\t<i>Cante.</i>')])
+        prompts = self.run_cmd([response('1\tOlá, | amigo.\n2\t<i>Devemos 32.</i>\n3\t<i>Cante.</i>')])
         self.assertEqual(len(prompts), 1)
         self.assertNotIn('[sighs]', prompts[0])
         out = lg.parse_srt(self.dir / 'video.pt-BR.srt')
@@ -198,13 +218,13 @@ class Pipeline(Base):
         self.assertEqual([c.timing for c in out], [c.timing for c in lg.parse_srt(self.srt)[1:]])
 
     def test_resume_only_asks_for_what_is_missing(self):
-        first = self.run_cmd([response('2\tOlá\n3\t<i>Devemos 32.</i>')])
+        first = self.run_cmd([response('1\tOlá\n2\t<i>Devemos 32.</i>')], block_size=2, max_blocks=1)
         self.assertFalse((self.dir / 'video.pt-BR.srt').exists(), 'SRT com buraco não pode ser gerado')
-        second = self.run_cmd([response('4\t<i>Cante.</i>')])
+        second = self.run_cmd([response('3\t<i>Cante.</i>')])
         self.assertEqual(len(first) + len(second), 2)
         translate = second[0].split('TRADUZIR')[1]
-        self.assertIn('4\t', translate)
-        self.assertNotIn('2\t', translate)
+        self.assertIn('3\t', translate)
+        self.assertNotIn('1\t', translate)
         self.assertIn('=> <i>Devemos 32.</i>', second[0].split('TRADUZIR')[0])
         self.assertEqual(self.run_cmd([]), [], 'tudo em cache: nenhuma chamada')
 
@@ -216,19 +236,19 @@ class Pipeline(Base):
         self.assertIn('8\t', translate)
 
     def test_ledger_counts_every_request_not_just_the_main_one(self):
-        reply = response('2\tOlá')
+        reply = response('1\tOlá')
         reply['modelUsage'] = {'claude-haiku': {'inputTokens': 3000, 'outputTokens': 700, 'cacheCreationInputTokens': 90, 'thinkingTokens': 40}}
-        self.run_cmd([reply])
+        self.run_cmd([reply], block_size=1, max_blocks=1)
         row = lg.Store(lg.speech_cues(lg.parse_srt(self.srt)), 'haiku', 'high').usage()[0]
         self.assertEqual((row['input_tokens'], row['output_tokens'], row['cache_creation_input_tokens'], row['thinking_tokens']), (3000, 700, 90, 40))
 
     def test_warns_only_when_requested_model_is_absent(self):
         for used, warned in ((['claude-haiku-5-5', 'claude-sonnet-5-5'], False), (['claude-haiku-5-5'], True)):
-            reply = response('2\tOlá')
+            reply = response('1\tOlá')
             reply['modelUsage'] = {name: {} for name in used}
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
-                self.run_cmd([reply], model='sonnet', effort=f'{"low" if warned else "medium"}', max_blocks=1)
+                self.run_cmd([reply], model='sonnet', effort=f'{"low" if warned else "medium"}', block_size=1, max_blocks=1)
             self.assertEqual('AVISO' in out.getvalue(), warned)
 
     def test_model_swap_ignores_only_the_auxiliary_haiku(self):
@@ -245,7 +265,7 @@ class Pipeline(Base):
         self.assertRegex(out.getvalue(), r'Blocos nesta rodada: 1\nProgresso: 0 de 3 legendas\n')
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            self.run_cmd([response('2\tOlá\n3\t<i>Devemos 32.</i>\n4\t<i>Cante.</i>')])
+            self.run_cmd([response('1\tOlá\n2\t<i>Devemos 32.</i>\n3\t<i>Cante.</i>')])
         self.assertRegex(out.getvalue(), r'(?m)^Traduzindo: bloco 1 de 1, legendas 2-4\nBloco 2-4: ')
         self.assertRegex(out.getvalue(), r'(?m)^Progresso: 3 de 3 legendas\n')
         self.assertIn(f'\nGerado {(self.dir / "video.pt-BR.srt").resolve()}\n', out.getvalue())
@@ -340,7 +360,7 @@ class Pipeline(Base):
             self.assertEqual(popen.call_count, 3, 'arquivo mudou')
 
     def test_max_blocks_limits_calls(self):
-        prompts = self.run_cmd([response('2\tOlá')], block_size=1, max_blocks=1)
+        prompts = self.run_cmd([response('1\tOlá')], block_size=1, max_blocks=1)
         self.assertEqual(len(prompts), 1)
 
     def test_refusal_is_flagged_not_translated(self):
@@ -358,7 +378,7 @@ class Pipeline(Base):
         self.assertIn('Blocos nesta rodada: 0\nProgresso: 0 de 3 legendas\nRecusadas: 3 legendas, 1 chamada(s) com --retry-refused\n', out.getvalue())
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            prompts = self.run_cmd([response('2\tOlá\n3\t<i>Devemos 32.</i>\n4\t<i>Cante.</i>')], retry_refused=True)
+            prompts = self.run_cmd([response('1\tOlá\n2\t<i>Devemos 32.</i>\n3\t<i>Cante.</i>')], retry_refused=True)
         self.assertEqual(len(prompts), 1)
         self.assertRegex(out.getvalue(), r'(?m)^Progresso: 3 de 3 legendas\n')
         self.assertTrue((self.dir / 'video.pt-BR.srt').exists())
@@ -372,10 +392,50 @@ class Pipeline(Base):
         self.assertIn('Recusadas: 1 legendas, 3 chamada(s) com --retry-refused\n', out.getvalue())
 
     def test_truncated_response_drops_last_line(self):
-        self.run_cmd([response('2\tOlá\n3\t<i>Dev', stop='max_tokens')])
+        self.run_cmd([response('1\tOlá\n2\t<i>Dev', stop='max_tokens'), response('Não posso.', stop='refusal')])
         store = lg.Store(lg.speech_cues(lg.parse_srt(self.srt)), 'haiku', 'high')
-        self.assertIsNotNone(store.get(2))
-        self.assertIsNone(store.get(3))
+        self.assertEqual(store.get(2)['pt'], ['Olá'])
+        self.assertIsNone(store.get(3)['pt'])
+
+    def test_prompt_numbers_have_no_holes_but_cache_keeps_srt_ids(self):
+        # Como o s02e02: a 395 era só efeito, e o modelo escrevia 395 no lugar de 396.
+        texts = {1: 'one', 2: '[door slams]', 3: 'three', 4: 'four', 5: '♪ music ♪', 6: 'six'}
+        self.srt.write_text('\n'.join(f'{i}\n00:00:{i:02},000 --> 00:00:{i:02},900\n{t}\n' for i, t in texts.items()), encoding='utf-8')
+        prompts = self.run_cmd([response('1\tum\n2\ttrês')], block_size=2, max_blocks=1)
+        self.assertEqual(prompts[0], 'TRADUZIR\n1\tone\n2\tthree')
+        prompts = self.run_cmd([response('3\tquatro\n4\tseis')])
+        self.assertEqual(prompts[0], 'CONTEXTO\n1\tone => um\n2\tthree => três\nTRADUZIR\n3\tfour\n4\tsix')
+        out = lg.parse_srt(self.dir / 'video.pt-BR.srt')
+        self.assertEqual([(c.timing[:8], c.lines) for c in out],
+                         [('00:00:01', ['um']), ('00:00:03', ['três']), ('00:00:04', ['quatro']), ('00:00:06', ['seis'])])
+        store = lg.Store(lg.speech_cues(lg.parse_srt(self.srt)), 'haiku', 'high')
+        self.assertEqual(sorted(store.entries, key=int), ['1', '3', '4', '6'])
+
+    def test_discarded_block_is_sent_again_in_the_same_run(self):
+        shifted = response('1\tOlá, devemos 32.\n2\t<i>Cante.</i>')
+        good = response('1\tOlá\n2\t<i>Devemos 32.</i>\n3\t<i>Cante.</i>')
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            prompts = self.run_cmd([shifted, good])
+        self.assertEqual(len(prompts), 2)
+        self.assertEqual(prompts[0], prompts[1], 'o bloco volta inteiro, com o mesmo contexto')
+        self.assertIn('Traduzindo: bloco 1 de 1 (nova tentativa), legendas 2-4\n', out.getvalue())
+        out = lg.parse_srt(self.dir / 'video.pt-BR.srt')
+        self.assertEqual([c.lines for c in out], [['Olá'], ['<i>Devemos 32.</i>'], ['<i>Cante.</i>']])
+
+    def test_retry_resends_only_what_is_missing(self):
+        prompts = self.run_cmd([response('1\tOlá\n2\t<i>Dev', stop='max_tokens'), response('2\t<i>Devemos 32.</i>\n3\t<i>Cante.</i>')])
+        translate = prompts[1].split('TRADUZIR')
+        self.assertIn('1\tHello there, | my friend. => Olá', translate[0])
+        self.assertNotIn('1\t', translate[1])
+        self.assertTrue((self.dir / 'video.pt-BR.srt').exists())
+
+    def test_only_one_retry_then_left_for_next_run(self):
+        shifted = response('1\tOlá, devemos 32.\n2\t<i>Cante.</i>')
+        self.assertEqual(len(self.run_cmd([shifted, shifted])), 2)
+        self.assertEqual(self.code, 0)
+        self.assertFalse((self.dir / 'video.pt-BR.srt').exists())
+        self.assertEqual(lg.Store(lg.speech_cues(lg.parse_srt(self.srt)), 'haiku', 'high').entries, {}, 'nada desalinhado no cache')
 
     def test_model_error_stops_without_writing(self):
         def boom(*a):
@@ -487,7 +547,7 @@ class Effort(Base):
                 lg.main()
 
     def test_each_effort_has_its_own_cache_and_ledger(self):
-        reply = '2\tOlá\n3\t<i>Devemos 32.</i>\n4\t<i>Cante.</i>'
+        reply = '1\tOlá\n2\t<i>Devemos 32.</i>\n3\t<i>Cante.</i>'
         self.run_cmd([response(reply)], effort='high')
         self.assertEqual(self.efforts, ['high'])
         self.assertEqual(len(self.run_cmd([response(reply)], effort='medium')), 1, 'outro esforço não aproveita o cache')
@@ -547,7 +607,7 @@ class Review(Base):
         self.assertEqual(lg.Store(self.cues, 'haiku', 'high').get(3)['pt'], ['x' * 30])
 
     def test_resume_only_asks_for_what_is_missing(self):
-        self.review([response('3\ttrês')])
+        self.review([response('3\ttrês')], block_size=1)
         again = self.review([response('5\tcinco')])
         self.assertEqual([x.split('\t')[0] for x in again[0].split('REVISAR')[1].strip().split('\n')], ['5'])
         self.assertEqual(self.review([]), [], 'tudo revisado: nenhuma chamada')
