@@ -5,7 +5,7 @@ Gera legendas em pt-BR para vídeos MKV que só têm legenda em inglês. Uso pes
 ## Decisões já tomadas
 
 - **Saída padrão:** `<nome do vídeo>.pt-BR.srt` ao lado do vídeo. O vídeo original nunca é alterado.
-- **`--embed` (opcional):** gera MKV novo com a trilha pt-BR. Só substitui o original depois de comparar as trilhas byte a byte, e manda o antigo para a Lixeira.
+- **`--embed` (opcional, ainda não implementado):** gera MKV novo com a trilha pt-BR. Só substitui o original depois de comparar as trilhas byte a byte, e manda o antigo para a Lixeira.
 - **Sem API paga.** Toda chamada de modelo usa `claude -p` com os limites da assinatura (plano Pro). Não usar SDK, Batch API nem `ANTHROPIC_API_KEY`.
 - **Etapas sem LLM ficam em script.** Só tradução, glossário e revisão consomem limite.
 - **A saída só leva fala.** Sem efeitos, sons, música, letras de música nem nome de quem fala. A remoção é local e acontece antes do modelo.
@@ -16,10 +16,10 @@ Gera legendas em pt-BR para vídeos MKV que só têm legenda em inglês. Uso pes
 |---|---|
 | Extrair legenda, compactar sem tempos, validar, remontar | Python + MKVToolNix |
 | Remover efeitos, sons, música, letras e nomes | Python |
-| Glossário por série (nomes, apelidos, gênero dos personagens) | Sonnet, uma vez por temporada |
+| Glossário por série (nomes, apelidos, gênero dos personagens) | Sonnet, uma vez por temporada (ainda não implementado) |
 | Tradução | Sonnet em esforço médio, em blocos de cerca de 100 legendas, com as 5 anteriores como contexto |
 | Revisão do que foi sinalizado | Só sob pedido, com `legendar.py review`: não compensou como etapa automática |
-| Exceções (Sonnet falhou duas vezes, ou pedido manual) | Opus |
+| Exceções (Sonnet falhou duas vezes, ou pedido manual) | Opus (ainda não implementado) |
 
 Reprocessar só legendas com problema. Guardar o resultado em cache local por legenda, para retomar sem gastar de novo. Ao encurtar uma legenda, conferir se o sentido foi mantido.
 
@@ -52,19 +52,19 @@ env -u ANTHROPIC_API_KEY -u CLAUDE_CODE_EFFORT_LEVEL claude -p "<prompt>" --mode
 - Medir tokens por `modelUsage`, não por `usage`: no piloto, `usage` omitiu 3.112 de entrada e 452 de saída, e só `modelUsage` fecha com `total_cost_usd`. Separar por modelo: cada chamada inclui uma requisição auxiliar do Haiku com cerca de 3.100 de entrada, mesmo quando o modelo pedido é o Sonnet.
 - `--effort` é sempre explícito e faz parte da chave do cache. `CLAUDE_CODE_EFFORT_LEVEL` tem precedência sobre a flag, por isso sai do ambiente. O JSON não informa o nível efetivo.
 
-## Piloto (próximo passo)
+## Piloto (concluído em 2026-11-02)
 
-Usar `pilot/<episodio>/`, que não vai para o git:
+Fica em `pilot/<episodio>/`, que não vai para o git:
 
 - `en.srt` e `en.tsv`: original (964 legendas).
 - `pt-BR.srt`: tradução de referência, feita à mão com Opus. Boa base, mas não é gabarito.
 - `pt1..4.txt` e `overrides.txt`: partes de que `pt-BR.srt` foi montado. O script que as juntava saiu do repositório (ver o histórico do git).
 
-Comparar Haiku sozinho, Haiku + Sonnet e Sonnet sozinho com a referência. O usuário avalia uma amostra de 30 legendas. Registrar os tokens de cada variante e adotar o mais simples que mantiver a qualidade.
+Comparou Haiku sozinho, Haiku + Sonnet e Sonnet sozinho com a referência, numa amostra de 30 legendas, registrando os tokens de cada variante, para adotar o mais simples que mantivesse a qualidade.
 
-Fazer primeiro com um bloco só e medir, antes de gastar limite com o episódio inteiro. Evitar rodadas em paralelo: o plano Pro tem limite baixo.
+Continua valendo: ao mudar prompt ou numeração, rodar primeiro um bloco só (`--max-blocks 1`) e conferir, antes de gastar limite com o episódio inteiro. Evitar rodadas em paralelo: o plano Pro tem limite baixo.
 
-Alerta: no primeiro teste, sem contexto, o Haiku traduziu "I got this." como "Eu me entendi com isso." O certo seria "Eu dou conta." Uma frase isolada não prova nada, mas o piloto precisa medir isso.
+No primeiro teste, sem contexto, o Haiku traduziu "I got this." como "Eu me entendi com isso." O certo seria "Eu dou conta."
 
 Resultado às cegas de 2026-11-02, bloco 401-507, detalhes em `pilot/<episodio>/cega-resultado.md`:
 
@@ -80,15 +80,16 @@ Haiku + Sonnet, revisando 27 legendas sinalizadas, detalhes em `pilot/<episodio>
 - A revisão gastou 7.899 tokens de raciocínio. O conjunto custou cerca de 3 vezes o Sonnet sozinho em equivalente API.
 - 26 das 27 foram sinalizadas por velocidade. Com 25 cps, seriam 15.
 - Decisão do usuário em 2026-11-02: Sonnet médio sozinho. O SRT final de `run` não aplica revisão.
-- `SYSTEM_PROMPT` ainda cita ♪. Ficou assim para não invalidar o cache durante o piloto; tirar quando o prompt mudar.
+- Em 2026-11-10 o ♪ saiu do `SYSTEM_PROMPT` (o `PROMPT_ID` mudou de 70a6ccdc para d5b5f965). Os caches do piloto ficaram com o ID antigo: `review`, `compare` e `blind` sobre eles não acham mais a tradução, e um `run` novo nesses episódios traduz tudo de novo.
 
-Episódio inteiro com `sonnet:medium` (751 legendas, 8 chamadas): cerca de US$ 0,27 em equivalente API. Uma chamada gastou 3.449 tokens de raciocínio, e as outras, nenhum. 75 legendas ficaram acima de 22 cps. O consumo do limite do plano ainda depende da leitura do `/usage`.
+Episódio inteiro com `sonnet:medium` (751 legendas, 8 chamadas): cerca de US$ 0,27 em equivalente API. Uma chamada gastou 4.075 tokens de raciocínio, e as outras sete, de 320 a 643. 75 legendas ficaram acima de 22 cps. O consumo do limite do plano ainda depende da leitura do `/usage`.
 
 ## Lições da primeira execução
 
 - O Sonnet às vezes junta duas legendas de uma mesma frase e renumera as seguintes, deslocando as traduções em uma posição sem erro aparente. Em 2026-11-07, no s02e02, aconteceu em 2 de 11 blocos (349-452 e 785-893), e o parser antigo pôs os dois desalinhados no cache. Agora a resposta só entra se os IDs baterem exatamente com o bloco, na ordem; senão o bloco volta inteiro, uma vez, na mesma rodada. Respostas antigas podem ser reauditadas pelo `raw/` do cache.
-- O bloco 349-452 errou duas vezes do mesmo jeito: depois de cada ID que faltava por ter sido removido (395, 406, 434, 438), o modelo escrevia esse ID no lugar do seguinte. Ele conta, não copia. Por isso o prompt de tradução numera as falas em sequência (1, 2, 3...) e converte de volta; cache e SRT usam o ID real. Não muda o `SYSTEM_PROMPT` nem a chave do cache. Os números citados em `ID fora do bloco` são os do prompt. A revisão ainda usa os IDs reais.
-- Limite de 22 caracteres por segundo foi escolhido sem medir. 96 legendas ainda passam dele; rever o critério.
+- O bloco 349-452 errou duas vezes do mesmo jeito: depois de cada ID que faltava por ter sido removido (395, 406, 434, 438), o modelo escrevia esse ID no lugar do seguinte. Ele conta, não copia. Por isso cada prompt de tradução numera as falas a partir de 1, contando o contexto, e converte de volta; cache e SRT usam o ID real. Numerar pela posição no episódio não bastava: ao retomar, um bloco pode juntar trechos distantes do que ficou pendente, e o salto volta. Os números citados em `ID fora do bloco` são os do prompt. A revisão ainda usa os IDs reais.
+- A numeração por prompt e o prompt sem ♪ ainda não rodaram num episódio real. No próximo, começar com `--max-blocks 1` e conferir o bloco.
+- Limite de 22 caracteres por segundo foi escolhido sem medir. 96 legendas ainda passam dele; rever o critério. O fim de cada `run` mostra quantas foram sinalizadas e por quê.
 - Ao encurtar, perderam-se detalhes nas legendas 277, 779 e 882.
 - O gênero de alguns personagens não dá para saber só pelo texto; registrar no glossário.
 - No macOS, `sed` não remove BOM com `\xEF`. Comparar legendas em Python.

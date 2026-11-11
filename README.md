@@ -63,7 +63,7 @@ Cada legenda traduzida fica em cache em `.cache/`, então uma execução interro
 ## Recusas e legendas sinalizadas
 
 - **Recusa do modelo:** a legenda fica sem tradução e impede a geração do SRT. Para tentar de novo, use `--retry-refused` ou, no app, **Tentar as recusadas**, que aparece depois de traduzir o que falta.
-- **Sinais de revisão:** falhas de validação, leitura acima de 22 caracteres por segundo e dúvidas marcadas pelo modelo são registradas, mas não são corrigidas automaticamente.
+- **Sinais de revisão:** falhas de validação, leitura acima de 22 caracteres por segundo e dúvidas marcadas pelo modelo são contadas no fim de cada execução, mas não são corrigidas automaticamente.
 - **Revisão sob pedido:** `legendar.py review` manda ao modelo só o que foi sinalizado. O resultado fica em cache próprio e ainda não entra no SRT final.
 
 ## Limitações

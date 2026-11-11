@@ -114,6 +114,12 @@ class Response(unittest.TestCase):
     def test_out_of_order_discards_the_block(self):
         self.assertEqual(lg.parse_response('3\tdois\n2\tum', [2, 3])[0], {})
 
+    def test_empty_line_inside_a_cue_is_dropped(self):
+        # Linha vazia dentro de uma legenda encerraria a legenda no SRT.
+        found, problems = lg.parse_response('2\t| Olá\n3\tTchau |', [2, 3])
+        self.assertEqual(found, {2: (['Olá'], False), 3: (['Tchau'], False)})
+        self.assertEqual(lg.parse_response('2\t|\n3\tTchau', [2, 3])[0], {}, 'sem texto, o bloco volta')
+
     def test_truncated_keeps_a_prefix_minus_the_cut_line(self):
         found, problems = lg.parse_response('2\tum\n3\tdo', [2, 3, 5], truncated=True)
         self.assertEqual(list(found), [2])
@@ -230,10 +236,10 @@ class Pipeline(Base):
 
     def test_context_is_the_five_previous_cues(self):
         self.srt.write_text('\n'.join(f'{i}\n00:00:{i:02},000 --> 00:00:{i:02},500\nline {i}\n' for i in range(1, 10)), encoding='utf-8')
-        prompts = self.run_cmd([response('8\toito\n9\tnove')], start=8)
+        prompts = self.run_cmd([response('6\toito\n7\tnove')], start=8)
         context, translate = prompts[0].split('TRADUZIR')
-        self.assertEqual([x.split('\t')[0] for x in context.split('\n')[1:-1]], ['3', '4', '5', '6', '7'])
-        self.assertIn('8\t', translate)
+        self.assertEqual([x.split('\t')[1] for x in context.split('\n')[1:-1]], [f'line {i}' for i in range(3, 8)])
+        self.assertEqual(translate, '\n6\tline 8\n7\tline 9')
 
     def test_ledger_counts_every_request_not_just_the_main_one(self):
         reply = response('1\tOlá')
@@ -383,6 +389,18 @@ class Pipeline(Base):
         self.assertRegex(out.getvalue(), r'(?m)^Progresso: 3 de 3 legendas\n')
         self.assertTrue((self.dir / 'video.pt-BR.srt').exists())
 
+    def test_discarded_retry_of_refused_block_is_sent_again(self):
+        good = response('1\tOlá\n2\t<i>Devemos 32.</i>\n3\t<i>Cante.</i>')
+        self.run_cmd([response('Não posso.', stop='refusal')])
+        shifted = response('1\tOlá, devemos 32.\n2\t<i>Cante.</i>')
+        self.assertEqual(len(self.run_cmd([shifted, good], retry_refused=True)), 2)
+        self.assertTrue((self.dir / 'video.pt-BR.srt').exists())
+
+    def test_refusal_on_retry_is_not_sent_twice(self):
+        refusal = response('Não posso.', stop='refusal')
+        self.run_cmd([refusal])
+        self.assertEqual(len(self.run_cmd([refusal, refusal], retry_refused=True)), 1)
+
     def test_retry_count_ignores_max_blocks(self):
         self.run_cmd([response('Não posso.', stop='refusal')], block_size=1, max_blocks=1)
         out = io.StringIO()
@@ -410,6 +428,23 @@ class Pipeline(Base):
                          [('00:00:01', ['um']), ('00:00:03', ['três']), ('00:00:04', ['quatro']), ('00:00:06', ['seis'])])
         store = lg.Store(lg.speech_cues(lg.parse_srt(self.srt)), 'haiku', 'high')
         self.assertEqual(sorted(store.entries, key=int), ['1', '3', '4', '6'])
+
+    def test_resumed_block_with_distant_cues_has_no_jump(self):
+        # Ao retomar, um bloco pode juntar trechos distantes: a numeração não pode saltar.
+        self.srt.write_text('\n'.join(f'{i}\n00:00:{i:02},000 --> 00:00:{i:02},900\nline {i}\n' for i in range(1, 7)), encoding='utf-8')
+        store = lg.Store(lg.speech_cues(lg.parse_srt(self.srt)), 'haiku', 'high')
+        for i in (3, 4):
+            store.put(i, [f'linha {i}'])
+        store.save()
+        prompts = self.run_cmd([response('1\tum\n2\tdois\n3\tcinco\n4\tseis')])
+        self.assertEqual(prompts[0], 'TRADUZIR\n1\tline 1\n2\tline 2\n3\tline 5\n4\tline 6')
+        self.assertEqual([c.lines for c in lg.parse_srt(self.dir / 'video.pt-BR.srt')], [['um'], ['dois'], ['linha 3'], ['linha 4'], ['cinco'], ['seis']])
+
+    def test_run_ends_with_flagged_count(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.run_cmd([response('1\tOlá\n2?\t<i>Devemos muito.</i>\n3\t<i>Cante.</i>')])
+        self.assertIn('Sinalizadas para revisão: 1 de 3 traduzidas (dúvida: 1, número perdido: 1)\n', out.getvalue())
 
     def test_discarded_block_is_sent_again_in_the_same_run(self):
         shifted = response('1\tOlá, devemos 32.\n2\t<i>Cante.</i>')
@@ -545,6 +580,13 @@ class Effort(Base):
         for argv in (['run', 'x.srt'], ['compare', 'x.srt', 'y.srt'], ['run', 'x.srt', '--effort', 'turbo']):
             with mock.patch.object(sys, 'argv', ['legendar.py'] + argv), mock.patch('sys.stderr'), self.assertRaises(SystemExit):
                 lg.main()
+
+    def test_base_and_reviewer_take_a_single_variant(self):
+        for argv in (['review', 'x.srt', '--base', 'haiku:high+sonnet:medium', '--by', 'sonnet:medium'],
+                     ['compare', 'x.srt', 'y.srt', '--effort', 'high', '--reviewed-by', 'a:high+b:low']):
+            with mock.patch.object(sys, 'argv', ['legendar.py'] + argv), mock.patch('sys.stderr'), self.assertRaises(SystemExit) as caught:
+                lg.main()
+            self.assertEqual(caught.exception.code, 2, 'erro de uso, não traceback')
 
     def test_each_effort_has_its_own_cache_and_ledger(self):
         reply = '1\tOlá\n2\t<i>Devemos 32.</i>\n3\t<i>Cante.</i>'
