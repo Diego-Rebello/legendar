@@ -26,6 +26,9 @@ BLOCK_SIZE = 100
 CONTEXT_CUES = 5
 MAX_LINE = 42
 MAX_CPS = 22  # escolhido sem medir, ver CLAUDE.md
+# Só sinaliza o que passa também do inglês com folga: no s02e03, 58 das 103 sinalizadas
+# por cps já passavam de 22 no original, e encurtar além do inglês perde sentido.
+CPS_OVER_SOURCE = 1.1
 MIN_CHARS_FOR_CPS = 15
 SAMPLE_SEED = 20261102
 EFFORTS = ('low', 'medium', 'high', 'xhigh', 'max')
@@ -166,6 +169,11 @@ def cps(cue, lines):
     return chars / (b - a) if b > a and chars > MIN_CHARS_FOR_CPS else 0
 
 
+def cps_limit(cue):
+    """MAX_CPS, ou o ritmo do próprio inglês com 10% de folga, o que for maior."""
+    return max(MAX_CPS, cps(cue, cue.lines) * CPS_OVER_SOURCE)
+
+
 def validate(cue, lines):
     """Marcas, itálico, tamanho e velocidade, mais números perdidos e trecho não traduzido."""
     flags = []
@@ -179,7 +187,7 @@ def validate(cue, lines):
         flags.append(f'{len(lines)} linhas')
     if any(len(x) > MAX_LINE for x in plain(lines)):
         flags.append('linha longa')
-    if cps(cue, lines) > MAX_CPS:
+    if cps(cue, lines) > cps_limit(cue):
         flags.append(f'{cps(cue, lines):.0f} cps')
     # Subtração, não <=: comparar Counter só existe do Python 3.10 em diante.
     if Counter(re.findall(r'\d+', s)) - Counter(re.findall(r'\d+', t)):
@@ -240,7 +248,7 @@ def build_prompt(block, context, number=lambda c: c.id):
 
 def max_chars(cue):
     a, b = (stamp(x) for x in cue.timing.split(' --> '))
-    return min(int((b - a) * MAX_CPS), 2 * MAX_LINE)
+    return min(int((b - a) * cps_limit(cue)), 2 * MAX_LINE)
 
 
 def build_review_prompt(block, context, base):

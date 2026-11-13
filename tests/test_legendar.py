@@ -140,6 +140,14 @@ class Validation(unittest.TestCase):
         self.assertIn('linha longa', flags)
         self.assertIn('43 cps', flags)
 
+    def test_speed_is_judged_against_the_source(self):
+        timing = '00:00:00,000 --> 00:00:01,000'
+        fast = cue(['x' * 30], timing)
+        self.assertNotIn('33 cps', lg.validate(fast, ['x' * 33]))
+        self.assertIn('34 cps', lg.validate(fast, ['x' * 34]))
+        self.assertIn('23 cps', lg.validate(cue(['x' * 16], timing), ['x' * 23]))
+        self.assertEqual(lg.max_chars(fast), 33)
+
     def test_untranslated(self):
         self.assertIn('igual ao original', lg.validate(cue(['Hello there']), ['Hello there']))
         self.assertEqual(lg.validate(cue(['Cubano.']), ['Cubano.']), [])
