@@ -45,11 +45,12 @@ env -u ANTHROPIC_API_KEY -u CLAUDE_CODE_EFFORT_LEVEL claude -p "<prompt>" --mode
 ```
 
 - Rodar a partir de uma pasta sem `CLAUDE.md`, ou confirmar que este arquivo não entra no contexto.
-- Essa combinação custou cerca de 600 tokens de entrada por chamada, então evitar blocos pequenos demais.
+- Essa combinação custou cerca de 600 tokens de entrada por chamada no piloto. Em 2026-11-13 o custo fixo foi de cerca de 1.150 tokens, contando o `SYSTEM_PROMPT`. Por isso uma sobra de até 1/4 do bloco entra no último bloco.
+- Em 2026-11-13, toda a entrada veio como `cacheCreationInputTokens` (TTL de 1 h, US$ 4/M contra US$ 10/M da saída) e nada foi lido do cache: cada prompt é diferente e o prefixo fixo é curto demais para o cache. Isso foi 22% do equivalente API do episódio. `DISABLE_PROMPT_CACHING=1` ainda não foi testado aqui.
 - `--bare` não serve: ele só aceita chave de API e ignora o login da assinatura.
 - Antes de rodar, conferir `claude auth status`: abortar se `authMethod` não for `claude.ai`.
 - `--json-schema` existe para saída estruturada, mas ainda não foi testado aqui.
-- Medir tokens por `modelUsage`, não por `usage`: no piloto, `usage` omitiu 3.112 de entrada e 452 de saída, e só `modelUsage` fecha com `total_cost_usd`. Separar por modelo: cada chamada inclui uma requisição auxiliar do Haiku com cerca de 3.100 de entrada, mesmo quando o modelo pedido é o Sonnet.
+- Medir tokens por `modelUsage`, não por `usage`: no piloto, `usage` omitiu 3.112 de entrada e 452 de saída, e só `modelUsage` fecha com `total_cost_usd`. Separar por modelo: no piloto, cada chamada incluía uma requisição auxiliar do Haiku com cerca de 3.100 de entrada, mesmo quando o modelo pedido era o Sonnet. No s02e03, em 2026-11-13, ela não apareceu em nenhuma das 9 chamadas.
 - `--effort` é sempre explícito e faz parte da chave do cache. `CLAUDE_CODE_EFFORT_LEVEL` tem precedência sobre a flag, por isso sai do ambiente. O JSON não informa o nível efetivo.
 
 ## Piloto (concluído em 2026-11-02)
@@ -88,8 +89,8 @@ Episódio inteiro com `sonnet:medium` (751 legendas, 8 chamadas): cerca de US$ 0
 
 - O Sonnet às vezes junta duas legendas de uma mesma frase e renumera as seguintes, deslocando as traduções em uma posição sem erro aparente. Em 2026-11-07, no s02e02, aconteceu em 2 de 11 blocos (349-452 e 785-893), e o parser antigo pôs os dois desalinhados no cache. Agora a resposta só entra se os IDs baterem exatamente com o bloco, na ordem; senão o bloco volta inteiro, uma vez, na mesma rodada. Respostas antigas podem ser reauditadas pelo `raw/` do cache.
 - O bloco 349-452 errou duas vezes do mesmo jeito: depois de cada ID que faltava por ter sido removido (395, 406, 434, 438), o modelo escrevia esse ID no lugar do seguinte. Ele conta, não copia. Por isso cada prompt de tradução numera as falas a partir de 1, contando o contexto, e converte de volta; cache e SRT usam o ID real. Numerar pela posição no episódio não bastava: ao retomar, um bloco pode juntar trechos distantes do que ficou pendente, e o salto volta. Os números citados em `ID fora do bloco` são os do prompt. A revisão ainda usa os IDs reais.
-- A numeração por prompt e o prompt sem ♪ ainda não rodaram num episódio real. No próximo, começar com `--max-blocks 1` e conferir o bloco.
-- Limite de 22 caracteres por segundo foi escolhido sem medir. 96 legendas ainda passam dele; rever o critério. O fim de cada `run` mostra quantas foram sinalizadas e por quê.
+- A numeração por prompt e o prompt sem ♪ rodaram no s02e03 em 2026-11-13: 9 de 9 blocos alinhados de primeira, sem descarte. 810 legendas, cerca de US$ 0,41 em equivalente API. 53% da saída foi raciocínio, de 0 a 3.623 tokens por bloco.
+- Limite de 22 caracteres por segundo foi escolhido sem medir. 96 legendas ainda passam dele; rever o critério. No s02e03, 58 das 103 sinalizadas por cps já passavam de 22 no inglês. Só 54 ficaram acima de 22 e mais de 10% acima do inglês. Com 25 cps e a mesma regra, seriam 31. O fim de cada `run` mostra quantas foram sinalizadas e por quê.
 - Ao encurtar, perderam-se detalhes nas legendas 277, 779 e 882.
 - O gênero de alguns personagens não dá para saber só pelo texto; registrar no glossário.
 - No macOS, `sed` não remove BOM com `\xEF`. Comparar legendas em Python.

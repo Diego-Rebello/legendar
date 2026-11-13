@@ -210,6 +210,23 @@ def numbering(context, block):
     return lambda c: position[c.id]
 
 
+def chunks(items, size):
+    """Blocos de `size`. Uma sobra de até 1/4 entra no último: cada chamada tem cerca de 1.150
+    tokens fixos, e no s02e03 o bloco final de 10 legendas custou quase tanto quanto elas."""
+    out = [items[n:n + size] for n in range(0, len(items), size)]
+    if len(out) > 1 and len(out[-1]) <= size // 4:
+        tail = out.pop()
+        out[-1] = out[-1] + tail
+    return out
+
+
+def usage_line(record):
+    cost = record['api_equivalent_usd']
+    return (f'entrada {record["input_tokens"]}, cache criado {record["cache_creation_input_tokens"]}, '
+            f'lido {record["cache_read_input_tokens"]}, saída {record["output_tokens"]} '
+            f'(raciocínio {record["thinking_tokens"]})' + (f', equivalente API US$ {cost:.3f}' if cost is not None else ''))
+
+
 def build_prompt(block, context, number=lambda c: c.id):
     parts = []
     if context:
@@ -541,7 +558,7 @@ def cmd_run(args):
 
     def to_send(retry_refused):
         left = [c for c in cues if c.id >= args.start and (known(c) is None if retry_refused else store.get(c.id) is None)]
-        return left, [left[n:n + args.block_size] for n in range(0, len(left), args.block_size)]
+        return left, chunks(left, args.block_size)
 
     def ready():
         return sum(1 for c in cues if known(c) is not None)
@@ -566,7 +583,7 @@ def cmd_run(args):
     out = video.with_name(f'{video.stem}.pt-BR.srt')
     if out.exists():
         print(f'Saída já existe: {out}')
-    failed = False
+    failed, records = False, []
     for n, block in enumerate(blocks, 1):
         if args.dry_run:
             context = context_of(block)
@@ -587,7 +604,8 @@ def cmd_run(args):
                 print(f'Parado no bloco {block[0].id}-{block[-1].id}: {e}', file=sys.stderr)
                 failed = True
                 break
-            print(f'Bloco {record["first"]}-{record["last"]}: entrada {record["input_tokens"]} + cache {record["cache_creation_input_tokens"]}/{record["cache_read_input_tokens"]}, saída {record["output_tokens"]}, stop_reason {record["stop_reason"]}')
+            records.append(record)
+            print(f'Bloco {record["first"]}-{record["last"]}: {usage_line(record)}, stop_reason {record["stop_reason"]}')
             for p in problems:
                 print(' ', p)
             progress()
@@ -612,6 +630,11 @@ def cmd_run(args):
         kinds = Counter(flag_kind(f) for fs in flags for f in fs)
         detail = ', '.join(f'{k}: {n}' for k, n in kinds.most_common())
         print(f'Sinalizadas para revisão: {sum(1 for fs in flags if fs)} de {len(flags)} traduzidas' + (f' ({detail})' if detail else ''))
+    if records:
+        total = lambda key: sum(r[key] or 0 for r in records)
+        print(f'Nesta rodada: {len(records)} chamada(s), saída {total("output_tokens")} (raciocínio {total("thinking_tokens")}), '
+              f'cache criado {total("cache_creation_input_tokens")}, lido {total("cache_read_input_tokens")}, '
+              f'equivalente API US$ {total("api_equivalent_usd"):.3f}')
     return 1 if failed else 0
 
 
@@ -626,7 +649,7 @@ def cmd_review(args):
     if not translated:
         raise SystemExit(f'Nada em cache para {args.base}: rode `run` antes.')
     pending = [c for c in translated if review.get(c.id) is None and review_flags(c, base.get(c.id))]
-    blocks = [pending[n:n + args.block_size] for n in range(0, len(pending), args.block_size)][:args.max_blocks]
+    blocks = chunks(pending, args.block_size)[:args.max_blocks]
     print(f'{len(translated)} legendas traduzidas, {len(review.entries)} já revisadas, {len(pending)} pendentes. Blocos nesta rodada: {len(blocks)}')
 
     position = {c.id: n for n, c in enumerate(cues)}
@@ -645,7 +668,7 @@ def cmd_review(args):
             print(f'Parado na revisão de {block[0].id}-{block[-1].id}: {e}', file=sys.stderr)
             failed = True
             break
-        print(f'Revisão {record["first"]}-{record["last"]} ({record["cues"]} legendas): entrada {record["input_tokens"]} + cache {record["cache_creation_input_tokens"]}/{record["cache_read_input_tokens"]}, saída {record["output_tokens"]}, stop_reason {record["stop_reason"]}')
+        print(f'Revisão {record["first"]}-{record["last"]} ({record["cues"]} legendas): {usage_line(record)}, stop_reason {record["stop_reason"]}')
         for p in problems:
             print(' ', p)
     if not args.dry_run:

@@ -365,6 +365,23 @@ class Pipeline(Base):
             lg.read_source(video)
             self.assertEqual(popen.call_count, 3, 'arquivo mudou')
 
+    def test_small_leftover_joins_the_last_block(self):
+        self.assertEqual([len(b) for b in lg.chunks(list(range(810)), 100)], [100] * 7 + [110])
+        self.assertEqual([len(b) for b in lg.chunks(list(range(826)), 100)], [100] * 8 + [26])
+        self.assertEqual([len(b) for b in lg.chunks(list(range(10)), 100)], [10])
+        self.assertEqual([len(b) for b in lg.chunks(list(range(3)), 1)], [1, 1, 1])
+        self.assertEqual(lg.chunks([], 100), [])
+
+    def test_run_ends_with_usage_totals(self):
+        reply = response('1\tOlá\n2\t<i>Devemos 32.</i>\n3\t<i>Cante.</i>')
+        reply['modelUsage'] = {'claude-haiku': {'outputTokens': 700, 'thinkingTokens': 40, 'cacheCreationInputTokens': 90}}
+        reply['total_cost_usd'] = 0.0125
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.run_cmd([reply])
+        self.assertIn('saída 700 (raciocínio 40), equivalente API US$ 0.013, stop_reason end_turn', out.getvalue())
+        self.assertIn('Nesta rodada: 1 chamada(s), saída 700 (raciocínio 40), cache criado 90, lido 0, equivalente API US$ 0.013', out.getvalue())
+
     def test_max_blocks_limits_calls(self):
         prompts = self.run_cmd([response('1\tOlá')], block_size=1, max_blocks=1)
         self.assertEqual(len(prompts), 1)
