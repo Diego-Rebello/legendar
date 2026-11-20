@@ -152,9 +152,31 @@ class Validation(unittest.TestCase):
         self.assertIn('igual ao original', lg.validate(cue(['Hello there']), ['Hello there']))
         self.assertEqual(lg.validate(cue(['Cubano.']), ['Cubano.']), [])
 
+    def test_names_and_interjections_may_stay_identical(self):
+        for text in ('Dr. Wilton,', 'Ooh. Mmm.', 'Bonjour, Lady Liberty!', '<i>Sleepy-Eyed Stranger,</i>'):
+            self.assertNotIn('igual ao original', lg.validate(cue([text]), [text]), text)
+
     def test_repeated_number_must_stay_repeated(self):
         self.assertIn('número perdido', lg.validate(cue(['5 and 5']), ['só 5']))
         self.assertNotIn('número perdido', lg.validate(cue(['5']), ['5 e 7']))
+
+    def test_converted_numbers_are_not_lost(self):
+        for src, pt in (('30 feet below', '9 metros abaixo'), ("Reminds me of '75.", 'Lembra 1975.'),
+                        ('late teens to mid-20s', 'fim da adolescência e os 25 anos')):
+            self.assertNotIn('número perdido', lg.validate(cue([src]), [pt]), src)
+        self.assertIn('número perdido', lg.validate(cue(['Room 75.']), ['Sala 57.']))
+        self.assertIn('número perdido', lg.validate(cue(['30 feet and 12 cops']), ['9 metros e uns policiais']))
+
+    def test_long_single_line_is_split_without_the_model(self):
+        long = 'E tenho a sensação de que não será a última vez'
+        for text in (long, '<i>' + long + '</i>'):
+            fit = lg.fit_lines([text])
+            self.assertEqual(len(fit), 2)
+            self.assertEqual(' '.join(fit), text)
+            self.assertTrue(all(len(x) <= lg.MAX_LINE for x in lg.plain(fit)))
+        self.assertNotIn('linha longa', lg.review_flags(cue(['And I got a feeling', "that it's not the last time"]), {'pt': [long]}))
+        for kept in (['Curta.'], ['- ' + long, '- Não.'], ['x' * 50 + ' ' + 'y' * 40]):
+            self.assertEqual(lg.fit_lines(kept), kept)
 
     def test_timing_with_position_or_dot(self):
         for timing in ('00:00:00,000 --> 00:00:10,000 X1:100 X2:200 Y1:1 Y2:2', '00:00:00.000 --> 00:00:10.000'):

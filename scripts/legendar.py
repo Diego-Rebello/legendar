@@ -49,6 +49,11 @@ MUSIC_TAG = re.compile(r'''(?<!<i>)♪\ (?:
 # com espaço depois, para não pegar "Look: a bird" nem "10:30".
 SPEAKER_LABEL = re.compile(r"(^|\|)((?:\s|-|<i>)*)(?:[A-Z][A-Z0-9 #.'-]+)?:(?=\s|$)\s*")
 
+# Número que a tradução converte e não copia: unidade imperial ("30 feet" vira 9 metros) e
+# década ("mid-20s"). No s02e04, eram as 4 sinalizadas por número perdido. Ano com apóstrofo
+# ('75 vira 1975) é tratado em validate.
+CONVERTED_NUMBER = re.compile(r'\d+(?:[ -]?(?:feet|foot|ft|inch(?:es)?|yards?|miles?|pounds?|lbs?|ounces?|degrees|mph)\b|s\b)', re.I)
+
 SYSTEM_PROMPT = """\
 Você traduz legendas de séries do inglês para o português do Brasil.
 
@@ -152,9 +157,24 @@ def speech_cues(cues):
     return out
 
 
+def fit_lines(lines):
+    """Quebra de novo, sem modelo, a legenda com linha acima de MAX_LINE que cabe em duas.
+
+    No s02e04, as 3 linhas longas eram duas linhas do inglês que o modelo juntou numa só.
+    Diálogo com travessão não é mexido: cada linha é de quem fala.
+    """
+    if (all(len(x) <= MAX_LINE for x in plain(lines)) or len(lines) > 2
+            or any(re.match(r'(?:<i>)?-', x) for x in lines)):
+        return lines
+    text = ' '.join(lines)
+    splits = [[text[:m.start()], text[m.end():]] for m in re.finditer(' ', text)]
+    best = min(splits, key=lambda s: max(len(x) for x in plain(s)), default=None)
+    return best if best and max(len(x) for x in plain(best)) <= MAX_LINE else lines
+
+
 def render_srt(cues, translated):
     # Renumera: sem efeitos, os IDs originais ficam com buracos.
-    return '\n'.join(f'{n}\n{c.timing}\n' + '\n'.join(translated[c.id]) + '\n' for n, c in enumerate(cues, 1))
+    return '\n'.join(f'{n}\n{c.timing}\n' + '\n'.join(fit_lines(translated[c.id])) + '\n' for n, c in enumerate(cues, 1))
 
 
 def stamp(s):
@@ -190,9 +210,12 @@ def validate(cue, lines):
     if cps(cue, lines) > cps_limit(cue):
         flags.append(f'{cps(cue, lines):.0f} cps')
     # Subtração, não <=: comparar Counter só existe do Python 3.10 em diante.
-    if Counter(re.findall(r'\d+', s)) - Counter(re.findall(r'\d+', t)):
+    missing = Counter(re.findall(r'\d+', CONVERTED_NUMBER.sub('', s))) - Counter(re.findall(r'\d+', t))
+    years = {y[-2:] for y in re.findall(r'\b(?:19|20)\d\d\b', t)}
+    if any(not (len(n) == 2 and n in years) for n in missing):
         flags.append('número perdido')
-    if len(s.split()) > 1 and s == t and re.search(r'[A-Za-z]', s):
+    # Só com palavra minúscula: nomes e interjeições ("Dr. Wilton,", "Ooh. Mmm.") ficam iguais mesmo.
+    if len(s.split()) > 1 and s == t and re.search(r'(?<![\w-])[a-z]{3,}', s):
         flags.append('igual ao original')
     return flags
 
@@ -201,7 +224,7 @@ def review_flags(cue, entry):
     """Sinais para revisão. Só 'recusa' e 'dúvida' vêm do modelo, o resto é recalculado."""
     flags = list(entry.get('flags', []))
     if entry['pt'] is not None:
-        flags += validate(cue, entry['pt'])
+        flags += validate(cue, fit_lines(entry['pt']))
     return flags
 
 
