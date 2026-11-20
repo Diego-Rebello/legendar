@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Gera legendas pt-BR para um MKV ou SRT em inglês, usando `claude -p` com a assinatura.
+"""Gera legendas pt-BR para um MKV ou SRT em inglês, usando `claude -p` ou `agy -p` pela assinatura.
 
 Uso (sempre com python3 -I, de fora da pasta dos dados):
-  legendar.py run VIDEO_OU_SRT --effort NIVEL [--model sonnet] [--from N] [--max-blocks K] [--retry-refused] [--dry-run]
-  legendar.py review SRT --base MODELO:NIVEL --by MODELO:NIVEL [--max-blocks K] [--dry-run]
-  legendar.py compare SRT REFERENCIA.srt --effort NIVEL [--model sonnet] [--reviewed-by MODELO:NIVEL] [--out amostra.md]
-  legendar.py blind SRT REFERENCIA.srt --variant MODELO:NIVEL --variant MODELO:NIVEL --out amostra.md --key chave.json
+  legendar.py run VIDEO_OU_SRT --effort NIVEL [--provider claude|agy] [--model MODELO] [--from N] [--max-blocks K] [--retry-refused] [--dry-run]
+  legendar.py review SRT --base [PROVEDOR/]MODELO:NIVEL --by [PROVEDOR/]MODELO:NIVEL [--max-blocks K] [--dry-run]
+  legendar.py compare SRT REFERENCIA.srt --effort NIVEL [--provider claude|agy] [--model MODELO] [--reviewed-by [PROVEDOR/]MODELO:NIVEL] [--out amostra.md]
+  legendar.py blind SRT REFERENCIA.srt --variant VARIANTE --variant VARIANTE --out amostra.md --key chave.json
   legendar.py unblind --key chave.json --notes notas.tsv
 
 A saída só leva fala: efeitos, sons, música, letras e nome de quem fala são removidos
@@ -31,10 +31,24 @@ MAX_CPS = 22  # escolhido sem medir, ver CLAUDE.md
 CPS_OVER_SOURCE = 1.1
 MIN_CHARS_FOR_CPS = 15
 SAMPLE_SEED = 20261102
+PROVIDERS = ('claude', 'agy')
+DEFAULT_MODEL = {'claude': 'sonnet', 'agy': 'gemini-4-hydrogen'}
 EFFORTS = ('low', 'medium', 'high', 'xhigh', 'max')
 MODEL_TIMEOUT = 900
 RETRIES = 1  # por bloco, na mesma rodada, quando a resposta não serve
 MKV_OK = (0, 1)  # man mkvextract: 1 é aviso, 2 é erro. Negativo é morte por sinal.
+# Sessão isolada do agy: sem chave de API, sem créditos extras pagos e sem nenhuma ferramenta.
+AGY_SETTINGS = json.dumps({
+    'modelProvider': '',
+    'useG1Credits': False,
+    'allowNonWorkspaceAccess': False,
+    'permissions': {
+        'deny': [
+            'read_file(*)', 'write_file(*)', 'command(*)',
+            'read_url(*)', 'execute_url(*)', 'download_url(*)', 'mcp(*)',
+        ],
+    },
+}, separators=(',', ':'))
 
 # Em inglês e em português, porque a referência também passa por aqui. Sem <i> antes:
 # letras vêm em itálico neste formato. A etiqueta sai primeiro porque, em
@@ -361,7 +375,33 @@ def claude_env():
     return {k: v for k, v in os.environ.items() if k not in ('ANTHROPIC_API_KEY', 'CLAUDE_CODE_EFFORT_LEVEL')}
 
 
-def check_auth():
+def agy_env():
+    # Garante que o agy use a conta Google do plano, nunca uma chave de API do ambiente.
+    return {k: v for k, v in os.environ.items() if k not in ('GEMINI_API_KEY', 'GOOGLE_API_KEY')}
+
+
+def check_auth(provider='claude', model=None, effort=None):
+    if provider == 'agy':
+        cmd = ['agy', '-p', '/effort']
+        if model:
+            cmd += ['--model', model]
+        if effort:
+            cmd += ['--effort', effort]
+        cmd += ['--settings', AGY_SETTINGS, '--output-format', 'json']
+        with tempfile.TemporaryDirectory(prefix='legendar-') as cwd:
+            try:
+                p = subprocess.run(cmd, cwd=cwd, env=agy_env(), capture_output=True, text=True, stdin=subprocess.DEVNULL)
+            except FileNotFoundError:
+                raise SystemExit('Abortado: comando agy não encontrado no PATH. Nada foi enviado ao modelo.')
+        try:
+            data = json.loads(p.stdout)
+        except json.JSONDecodeError:
+            detail = (p.stderr or p.stdout).strip()[:300]
+            raise SystemExit(f'Abortado: agy não confirmou o login (exit {p.returncode}): {detail}. Nada foi enviado ao modelo.')
+        if p.returncode or data.get('status') != 'SUCCESS' or data.get('command', {}).get('name') != 'effort':
+            detail = (data.get('error') or p.stderr or p.stdout).strip()[:300]
+            raise SystemExit(f'Abortado: agy não está pronto ({detail}). Nada foi enviado ao modelo.')
+        return
     try:
         p = subprocess.run(['claude', 'auth', 'status'], env=claude_env(), capture_output=True, text=True, stdin=subprocess.DEVNULL)
     except FileNotFoundError:
@@ -374,45 +414,75 @@ def check_auth():
         raise SystemExit(f'Abortado: authMethod é {method!r}, esperava claude.ai. Nada foi enviado ao modelo.')
 
 
-def call_model(prompt, model, effort, raw_dir, system=SYSTEM_PROMPT):
-    cmd = ['claude', '-p', prompt, '--model', model, '--effort', effort,
-           '--tools', '', '--strict-mcp-config', '--setting-sources', '',
-           '--disable-slash-commands', '--no-session-persistence',
-           '--system-prompt', system, '--output-format', 'json']
-    # Pasta vazia para nenhum CLAUDE.md entrar no contexto.
+def call_model(prompt, model, effort, raw_dir, system=SYSTEM_PROMPT, provider='claude'):
+    if provider == 'agy':
+        full_prompt = f'{system}\n\n{prompt}' if system else prompt
+        cmd = ['agy', '-p', full_prompt, '--model', model, '--effort', effort,
+               '--disable-slash-commands', '--print-timeout', f'{MODEL_TIMEOUT}s',
+               '--settings', AGY_SETTINGS, '--output-format', 'json']
+        env = agy_env()
+        raw_tag = f'agy-{model}-{effort}'
+    else:
+        cmd = ['claude', '-p', prompt, '--model', model, '--effort', effort,
+               '--tools', '', '--strict-mcp-config', '--setting-sources', '',
+               '--disable-slash-commands', '--no-session-persistence',
+               '--system-prompt', system, '--output-format', 'json']
+        env = claude_env()
+        raw_tag = f'{model}-{effort}'
+    # Pasta vazia para nenhum CLAUDE.md nem configuração local do projeto entrar no contexto.
     with tempfile.TemporaryDirectory(prefix='legendar-') as cwd:
         try:
-            p = start_child(cmd, cwd=cwd, env=claude_env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL)
+            p = start_child(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL)
         except FileNotFoundError:
-            raise ModelError('comando claude não encontrado no PATH')
+            raise ModelError(f'comando {provider} não encontrado no PATH')
         try:
             stdout, stderr = p.communicate(timeout=MODEL_TIMEOUT)
         except subprocess.TimeoutExpired:
             p.kill()
             p.communicate()
-            raise ModelError(f'sem resposta do claude em {MODEL_TIMEOUT} s')
+            raise ModelError(f'sem resposta do {provider} em {MODEL_TIMEOUT} s')
     stop_if_asked()
     # Grava antes de interpretar: um erro de parsing não pode custar outra chamada.
     raw_dir.mkdir(parents=True, exist_ok=True)
-    raw = raw_dir / f'{time.strftime("%Y%m%d-%H%M%S")}-{model}-{effort}.json'
+    raw = raw_dir / f'{time.strftime("%Y%m%d-%H%M%S")}-{raw_tag}.json'
     raw.write_text(stdout or stderr, encoding='utf-8')
     try:
         data = json.loads(stdout)
     except json.JSONDecodeError:
         raise ModelError(f'saída não é JSON (exit {p.returncode}), ver {raw}: {(stderr or stdout)[:300]}')
-    if data.get('is_error') or p.returncode:
+    if provider == 'agy':
+        if data.get('status') != 'SUCCESS' or p.returncode:
+            raise ModelError(f'erro do agy (exit {p.returncode}, status {data.get("status")}), ver {raw}: {str(data.get("error") or stderr)[:300]}')
+    elif data.get('is_error') or p.returncode:
         raise ModelError(f'erro do claude (exit {p.returncode}), ver {raw}: {str(data.get("result"))[:300]}')
     return data
 
 
-class Store:
-    """Cache por legenda. O caminho inclui o conteúdo do SRT, o modelo, o esforço e o prompt."""
+def parse_single(text):
+    """[PROVEDOR/]MODELO:NIVEL -> (provedor, modelo, nível)."""
+    head, _, effort = text.partition(':')
+    if '/' in head:
+        provider, _, model = head.partition('/')
+    else:
+        provider, model = 'claude', head
+    if provider not in PROVIDERS or not model or '/' in model or effort not in EFFORTS:
+        raise ValueError(text)
+    return provider, model, effort
 
-    def __init__(self, cues, model, effort, prompt=PROMPT_ID):
+
+def format_variant(provider, model, effort):
+    return f'{provider}/{model}:{effort}' if provider != 'claude' else f'{model}:{effort}'
+
+
+class Store:
+    """Cache por legenda. O caminho inclui o conteúdo do SRT, o provedor, o modelo, o esforço e o prompt."""
+
+    def __init__(self, cues, model, effort, prompt=PROMPT_ID, provider='claude'):
         h = hashlib.sha256('\n'.join(f'{c.id}\t{compact(c.lines)}' for c in cues).encode()).hexdigest()[:12]
         self.dir = CACHE_DIR / h
-        self.path = self.dir / f'{model}-{effort}-{prompt}.json'
-        self.model, self.effort, self.prompt = model, effort, prompt
+        prefix = f'{provider}-' if provider != 'claude' else ''
+        self.path = self.dir / f'{prefix}{model}-{effort}-{prompt}.json'
+        self.provider, self.model, self.effort, self.prompt = provider, model, effort, prompt
         self.usage_path = self.dir / 'usage.jsonl'
         self.entries = json.loads(self.path.read_text(encoding='utf-8')) if self.path.exists() else {}
 
@@ -437,17 +507,19 @@ class Store:
         if not self.usage_path.exists():
             return []
         rows = [json.loads(x) for x in self.usage_path.read_text(encoding='utf-8').splitlines()]
-        return [r for r in rows if r['model'] == self.model and r.get('effort') == self.effort and r['prompt'] == self.prompt]
+        return [r for r in rows if r.get('provider', 'claude') == self.provider and r['model'] == self.model
+                and r.get('effort') == self.effort and r['prompt'] == self.prompt]
 
 
 class Reviewed:
     """Tradução base com a revisão por cima. Revisão recusada mantém a base, com o sinal."""
 
     def __init__(self, cues, base, by):
-        base_model, base_effort = base.split(':')
-        by_model, by_effort = by.split(':')
-        self.base = Store(cues, base_model, base_effort)
-        self.review = Store(cues, by_model, by_effort, f'revisa-{base_model}-{base_effort}-{PROMPT_ID}-{REVIEW_ID}')
+        base_provider, base_model, base_effort = parse_single(base)
+        by_provider, by_model, by_effort = parse_single(by)
+        self.base = Store(cues, base_model, base_effort, provider=base_provider)
+        base_tag = f'{base_provider}-{base_model}' if base_provider != 'claude' else base_model
+        self.review = Store(cues, by_model, by_effort, f'revisa-{base_tag}-{base_effort}-{PROMPT_ID}-{REVIEW_ID}', provider=by_provider)
 
     def get(self, i):
         b, r = self.base.get(i), self.review.get(i)
@@ -461,7 +533,10 @@ class Reviewed:
 
 def open_variant(cues, spec):
     base, _, by = spec.partition('+')
-    return Reviewed(cues, base, by) if by else Store(cues, *base.split(':'))
+    if by:
+        return Reviewed(cues, base, by)
+    provider, model, effort = parse_single(base)
+    return Store(cues, model, effort, provider=provider)
 
 
 def extract_subtitle(mkv, dest):
@@ -521,35 +596,55 @@ def translate_block(block, context, model, effort, store, number):
 
 
 def ask(prompt, block, model, effort, store, system, number=lambda c: c.id):
-    data = call_model(prompt, model, effort, store.dir / 'raw', system)
-    # modelUsage soma todas as requisições da chamada e é o que fecha com total_cost_usd.
-    # usage cobre só a principal: no piloto, omitiu 3112 de entrada e 452 de saída.
-    by_model = data.get('modelUsage', {})
-    used = sorted(by_model)
-    total = lambda key: sum(m.get(key, 0) for m in by_model.values())
-    record = {
-        'at': datetime.datetime.now().isoformat(timespec='seconds'), 'model': model, 'effort': effort, 'prompt': store.prompt,
-        'models_used': used, 'first': block[0].id, 'last': block[-1].id, 'cues': len(block),
-        'input_tokens': total('inputTokens'),
-        'cache_creation_input_tokens': total('cacheCreationInputTokens'),
-        'cache_read_input_tokens': total('cacheReadInputTokens'),
-        'output_tokens': total('outputTokens'),
-        'thinking_tokens': total('thinkingTokens'),
-        'stop_reason': data.get('stop_reason'), 'duration_ms': data.get('duration_ms'),
-        'api_equivalent_usd': data.get('total_cost_usd'),
-    }
+    provider = store.provider
+    data = call_model(prompt, model, effort, store.dir / 'raw', system, provider)
+    if provider == 'agy':
+        usage = data.get('usage') or {}
+        used = [model]
+        record = {
+            'at': datetime.datetime.now().isoformat(timespec='seconds'), 'provider': provider, 'model': model, 'effort': effort, 'prompt': store.prompt,
+            'models_used': used, 'first': block[0].id, 'last': block[-1].id, 'cues': len(block),
+            'input_tokens': usage.get('input_tokens', 0),
+            'cache_creation_input_tokens': 0,
+            'cache_read_input_tokens': usage.get('cache_read_tokens', 0),
+            'output_tokens': usage.get('output_tokens', 0),
+            'thinking_tokens': usage.get('thinking_tokens', 0),
+            'stop_reason': data.get('status'),
+            'duration_ms': int(round((data.get('duration_seconds') or 0) * 1000)),
+            'api_equivalent_usd': None,
+        }
+        result_text = data.get('response', '')
+    else:
+        # modelUsage soma todas as requisições da chamada e é o que fecha com total_cost_usd.
+        # usage cobre só a principal: no piloto, omitiu 3112 de entrada e 452 de saída.
+        by_model = data.get('modelUsage', {})
+        used = sorted(by_model)
+        total = lambda key: sum(m.get(key, 0) for m in by_model.values())
+        record = {
+            'at': datetime.datetime.now().isoformat(timespec='seconds'), 'provider': provider, 'model': model, 'effort': effort, 'prompt': store.prompt,
+            'models_used': used, 'first': block[0].id, 'last': block[-1].id, 'cues': len(block),
+            'input_tokens': total('inputTokens'),
+            'cache_creation_input_tokens': total('cacheCreationInputTokens'),
+            'cache_read_input_tokens': total('cacheReadInputTokens'),
+            'output_tokens': total('outputTokens'),
+            'thinking_tokens': total('thinkingTokens'),
+            'stop_reason': data.get('stop_reason'), 'duration_ms': data.get('duration_ms'),
+            'api_equivalent_usd': data.get('total_cost_usd'),
+        }
+        result_text = data.get('result', '')
     store.log_usage(record)
-    if model_swapped(model, used):
+    if provider == 'claude' and model_swapped(model, used):
         print(f'AVISO: pedi {model}, mas a resposta usou {used}')
 
-    if data.get('stop_reason') == 'refusal':
+    if provider == 'claude' and data.get('stop_reason') == 'refusal':
         for c in block:
             store.put(c.id, None, ['recusa'])
         store.save()
         return record, ['recusa no bloco inteiro']
 
     # Os problemas citam o número do prompt; o cache e o aviso de faltantes, o ID do SRT.
-    found, problems = parse_response(data.get('result', ''), [number(c) for c in block], data.get('stop_reason') == 'max_tokens')
+    truncated = provider == 'claude' and data.get('stop_reason') == 'max_tokens'
+    found, problems = parse_response(result_text, [number(c) for c in block], truncated)
     for c in block:
         if number(c) in found:
             lines, doubt = found[number(c)]
@@ -577,11 +672,13 @@ def read_source(video):
 
 def cmd_run(args):
     video = Path(args.input).resolve()
+    provider = getattr(args, 'provider', 'claude')
+    model = args.model or DEFAULT_MODEL[provider]
     if not args.dry_run:
-        check_auth()
+        check_auth(provider, model, args.effort)
     original = parse_srt(read_source(video))
     cues = speech_cues(original)
-    store = Store(cues, args.model, args.effort)
+    store = Store(cues, model, args.effort, provider=provider)
 
     def known(c):
         entry = store.get(c.id)
@@ -629,9 +726,9 @@ def cmd_run(args):
             again = ' (nova tentativa)' if attempt else ''
             print(f'Traduzindo: bloco {n} de {len(blocks)}{again}, legendas {block[0].id}-{block[-1].id}')
             try:
-                record, problems = translate_block(block, context, args.model, args.effort, store, number)
+                record, problems = translate_block(block, context, model, args.effort, store, number)
             except ModelError as e:
-                # Erro do claude não tem nova tentativa automática: pode ser o limite do plano.
+                # Erro do provedor não tem nova tentativa automática: pode ser o limite do plano.
                 print(f'Parado no bloco {block[0].id}-{block[-1].id}: {e}', file=sys.stderr)
                 failed = True
                 break
@@ -663,19 +760,19 @@ def cmd_run(args):
         print(f'Sinalizadas para revisão: {sum(1 for fs in flags if fs)} de {len(flags)} traduzidas' + (f' ({detail})' if detail else ''))
     if records:
         total = lambda key: sum(r[key] or 0 for r in records)
+        cost = f', equivalente API US$ {total("api_equivalent_usd"):.3f}' if any(r['api_equivalent_usd'] is not None for r in records) else ''
         print(f'Nesta rodada: {len(records)} chamada(s), saída {total("output_tokens")} (raciocínio {total("thinking_tokens")}), '
-              f'cache criado {total("cache_creation_input_tokens")}, lido {total("cache_read_input_tokens")}, '
-              f'equivalente API US$ {total("api_equivalent_usd"):.3f}')
+              f'cache criado {total("cache_creation_input_tokens")}, lido {total("cache_read_input_tokens")}{cost}')
     return 1 if failed else 0
 
 
 def cmd_review(args):
     """Manda ao revisor só o que a tradução base deixou sinalizado."""
-    if not args.dry_run:
-        check_auth()
     cues = speech_cues(parse_srt(read_source(Path(args.input).resolve())))
     final = Reviewed(cues, args.base, args.by)
     base, review = final.base, final.review
+    if not args.dry_run:
+        check_auth(review.provider, review.model, review.effort)
     translated = [c for c in cues if base.get(c.id)]
     if not translated:
         raise SystemExit(f'Nada em cache para {args.base}: rode `run` antes.')
@@ -729,7 +826,9 @@ def cmd_compare(args):
     original = parse_srt(args.input)
     cues = speech_cues(original)
     ref = {c.id: c for c in speech_cues(parse_srt(args.reference))}
-    base = f'{args.model}:{args.effort}'
+    provider = getattr(args, 'provider', 'claude')
+    model = args.model or DEFAULT_MODEL[provider]
+    base = format_variant(provider, model, args.effort)
     store = open_variant(cues, f'{base}+{args.reviewed_by}' if args.reviewed_by else base)
     done = [c for c in cues if store.get(c.id) and store.get(c.id)['pt'] is not None]
     if not done:
@@ -775,18 +874,19 @@ def cmd_compare(args):
 
 
 def variant(text):
-    """MODELO:NIVEL, ou BASE+REVISOR com dois desses."""
+    """[PROVEDOR/]MODELO:NIVEL, ou BASE+REVISOR com dois desses."""
     for part in text.split('+', 1):
-        model, _, effort = part.partition(':')
-        if not model or effort not in EFFORTS:
-            raise argparse.ArgumentTypeError(f'esperava MODELO:NIVEL, com NIVEL em {EFFORTS}: {text!r}')
+        try:
+            parse_single(part)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f'esperava [PROVEDOR/]MODELO:NIVEL, com PROVEDOR em {PROVIDERS} e NIVEL em {EFFORTS}: {text!r}')
     return text
 
 
 def single(text):
-    """Só MODELO:NIVEL: --base, --by e --reviewed-by não aceitam BASE+REVISOR."""
+    """Só [PROVEDOR/]MODELO:NIVEL: --base, --by e --reviewed-by não aceitam BASE+REVISOR."""
     if '+' in text:
-        raise argparse.ArgumentTypeError(f'esperava um só MODELO:NIVEL: {text!r}')
+        raise argparse.ArgumentTypeError(f'esperava um só [PROVEDOR/]MODELO:NIVEL: {text!r}')
     return variant(text)
 
 
@@ -865,7 +965,8 @@ def main():
     sub = ap.add_subparsers(dest='cmd', required=True)
     r = sub.add_parser('run')
     r.add_argument('input')
-    r.add_argument('--model', default='sonnet')
+    r.add_argument('--provider', default='claude', choices=PROVIDERS, help='claude (padrão) ou agy (conta Google)')
+    r.add_argument('--model', default=None, help='padrão: sonnet no claude, gemini-4-hydrogen no agy')
     r.add_argument('--effort', required=True, choices=EFFORTS, help='sem padrão: o nível entra na chave do cache')
     r.add_argument('--from', dest='start', type=int, default=0, help='primeira legenda a traduzir')
     r.add_argument('--max-blocks', type=int, default=1, help='padrão 1: gastar limite é sempre explícito')
@@ -875,8 +976,8 @@ def main():
     r.set_defaults(func=cmd_run)
     v = sub.add_parser('review')
     v.add_argument('input')
-    v.add_argument('--base', required=True, type=single, help='MODELO:NIVEL da tradução')
-    v.add_argument('--by', required=True, type=single, help='MODELO:NIVEL do revisor')
+    v.add_argument('--base', required=True, type=single, help='[PROVEDOR/]MODELO:NIVEL da tradução')
+    v.add_argument('--by', required=True, type=single, help='[PROVEDOR/]MODELO:NIVEL do revisor')
     v.add_argument('--max-blocks', type=int, default=1, help='padrão 1: gastar limite é sempre explícito')
     v.add_argument('--block-size', type=int, default=BLOCK_SIZE)
     v.add_argument('--dry-run', action='store_true', help='não chama o modelo')
@@ -884,9 +985,10 @@ def main():
     c = sub.add_parser('compare')
     c.add_argument('input')
     c.add_argument('reference')
-    c.add_argument('--model', default='sonnet')
+    c.add_argument('--provider', default='claude', choices=PROVIDERS)
+    c.add_argument('--model', default=None)
     c.add_argument('--effort', required=True, choices=EFFORTS)
-    c.add_argument('--reviewed-by', type=single, help='MODELO:NIVEL de quem revisou')
+    c.add_argument('--reviewed-by', type=single, help='[PROVEDOR/]MODELO:NIVEL de quem revisou')
     c.add_argument('--sample', type=int, default=30)
     c.add_argument('--out')
     c.set_defaults(func=cmd_compare)

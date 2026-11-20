@@ -40,6 +40,13 @@ def response(text, stop='end_turn'):
             'modelUsage': {'claude-haiku': {}}, 'duration_ms': 1, 'total_cost_usd': 0}
 
 
+def agy_response(text, status='SUCCESS', usage=None):
+    return {
+        'conversation_id': 'c1', 'status': status, 'response': text, 'duration_seconds': 1.25, 'num_turns': 1,
+        'usage': usage or {'input_tokens': 100, 'output_tokens': 25, 'thinking_tokens': 10, 'cache_read_tokens': 50, 'total_tokens': 125},
+    }
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -53,15 +60,16 @@ class Base(unittest.TestCase):
 
     def run_cmd(self, replies, **kw):
         """Roda o pipeline com respostas simuladas e devolve os prompts enviados."""
-        prompts, replies, self.efforts, self.systems = [], list(replies), [], []
+        prompts, replies, self.efforts, self.systems, self.providers = [], list(replies), [], [], []
 
-        def fake(prompt, model, effort, raw_dir, system=None):
+        def fake(prompt, model, effort, raw_dir, system=None, provider='claude'):
             prompts.append(prompt)
             self.efforts.append(effort)
             self.systems.append(system)
+            self.providers.append(provider)
             return replies.pop(0)
 
-        args = SimpleNamespace(input=str(self.srt), model='haiku', effort='high', start=0, max_blocks=99, block_size=100, dry_run=False, retry_refused=False)
+        args = SimpleNamespace(input=str(self.srt), provider='claude', model='haiku', effort='high', start=0, max_blocks=99, block_size=100, dry_run=False, retry_refused=False)
         vars(args).update(kw)
         func = getattr(args, 'func', lg.cmd_run)
         with mock.patch.object(lg, 'call_model', fake), mock.patch.object(lg, 'check_auth'):
@@ -826,8 +834,8 @@ class Blind(Base):
 
 
 class Auth(unittest.TestCase):
-    def status(self, payload):
-        return mock.patch.object(lg.subprocess, 'run', return_value=SimpleNamespace(stdout=payload))
+    def status(self, payload, returncode=0, stderr=''):
+        return mock.patch.object(lg.subprocess, 'run', return_value=SimpleNamespace(stdout=payload, stderr=stderr, returncode=returncode))
 
     def test_accepts_subscription(self):
         with self.status(json.dumps({'authMethod': 'claude.ai'})):
@@ -841,6 +849,92 @@ class Auth(unittest.TestCase):
     def test_api_key_is_removed_from_env(self):
         with mock.patch.dict(lg.os.environ, {'ANTHROPIC_API_KEY': 'x'}):
             self.assertNotIn('ANTHROPIC_API_KEY', lg.claude_env())
+
+    def test_agy_auth_accepts_effort_preflight(self):
+        ok = json.dumps({'status': 'SUCCESS', 'command': {'name': 'effort', 'data': {'current': 'medium'}}})
+        with self.status(ok) as run:
+            lg.check_auth('agy', 'gemini-4-neon', 'medium')
+        cmd = run.call_args[0][0]
+        self.assertEqual(cmd[:5], ['agy', '-p', '/effort', '--model', 'gemini-4-neon'])
+        self.assertIn('--settings', cmd)
+        self.assertEqual(cmd[cmd.index('--effort') + 1], 'medium')
+
+    def test_agy_auth_aborts_on_error_or_missing_binary(self):
+        for payload, code in ((json.dumps({'status': 'ERROR', 'error': 'authentication required'}), 1), ('não é json', 1), (json.dumps({'status': 'SUCCESS'}), 0)):
+            with self.status(payload, returncode=code), self.assertRaises(SystemExit):
+                lg.check_auth('agy', 'gemini-4-neon', 'medium')
+        with mock.patch.object(lg.subprocess, 'run', side_effect=FileNotFoundError), self.assertRaisesRegex(SystemExit, 'agy não encontrado'):
+            lg.check_auth('agy', 'gemini-4-neon', 'medium')
+
+    def test_agy_env_strips_google_api_keys(self):
+        with mock.patch.dict(lg.os.environ, {'GEMINI_API_KEY': 'a', 'GOOGLE_API_KEY': 'b'}):
+            env = lg.agy_env()
+            self.assertNotIn('GEMINI_API_KEY', env)
+            self.assertNotIn('GOOGLE_API_KEY', env)
+
+
+class AgyProvider(Base):
+    def test_call_model_passes_isolated_settings_and_strips_keys(self):
+        done = mock.Mock(returncode=0)
+        done.communicate.return_value = (json.dumps(agy_response('1\tOlá')), '')
+        with mock.patch.dict(lg.os.environ, {'GEMINI_API_KEY': 'x', 'GOOGLE_API_KEY': 'y'}), \
+                mock.patch.object(lg.subprocess, 'Popen', return_value=done) as popen:
+            data = lg.call_model('TRADUZIR\n1\tHi', 'gemini-4-neon', 'medium', self.dir / 'raw', system='SYS', provider='agy')
+        self.assertEqual(data['response'], '1\tOlá')
+        cmd, kw = popen.call_args
+        argv = cmd[0]
+        self.assertEqual(argv[0], 'agy')
+        self.assertEqual(argv[argv.index('-p') + 1], 'SYS\n\nTRADUZIR\n1\tHi')
+        self.assertEqual(argv[argv.index('--model') + 1], 'gemini-4-neon')
+        self.assertEqual(argv[argv.index('--effort') + 1], 'medium')
+        self.assertIn('--disable-slash-commands', argv)
+        settings = json.loads(argv[argv.index('--settings') + 1])
+        self.assertEqual(settings['modelProvider'], '')
+        self.assertFalse(settings['useG1Credits'])
+        self.assertIn('command(*)', settings['permissions']['deny'])
+        self.assertNotIn('GEMINI_API_KEY', kw['env'])
+        self.assertNotIn('GOOGLE_API_KEY', kw['env'])
+        self.assertTrue(list((self.dir / 'raw').glob('*-agy-gemini-4-neon-medium.json')))
+
+    def test_call_model_raises_on_agy_error_status(self):
+        done = mock.Mock(returncode=1)
+        done.communicate.return_value = (json.dumps({'status': 'ERROR', 'error': 'quota exceeded'}), '')
+        with mock.patch.object(lg.subprocess, 'Popen', return_value=done), self.assertRaisesRegex(lg.ModelError, 'quota exceeded'):
+            lg.call_model('p', 'gemini-4-neon', 'medium', self.dir / 'raw', provider='agy')
+
+    def test_run_with_agy_translates_logs_usage_and_keeps_cache_separate(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.run_cmd([agy_response('1\tOlá, | amigo.\n2\t<i>Devemos 32.</i>\n3\t<i>Cante.</i>')],
+                         provider='agy', model=None, effort='medium')
+        self.assertEqual(self.providers, ['agy'])
+        self.assertTrue((self.dir / 'video.pt-BR.srt').exists())
+        self.assertNotIn('equivalente API US$', out.getvalue())
+        self.assertIn('saída 25 (raciocínio 10)', out.getvalue())
+        cues = lg.speech_cues(lg.parse_srt(self.srt))
+        agy_store = lg.Store(cues, 'gemini-4-hydrogen', 'medium', provider='agy')
+        self.assertEqual(agy_store.get(2)['pt'], ['Olá,', 'amigo.'])
+        self.assertEqual(agy_store.usage()[0]['provider'], 'agy')
+        self.assertEqual(agy_store.usage()[0]['duration_ms'], 1250)
+        self.assertEqual(lg.Store(cues, 'gemini-4-hydrogen', 'medium', provider='claude').entries, {})
+
+    def test_variant_parsing_and_cross_provider_blind(self):
+        self.assertEqual(lg.parse_single('sonnet:medium'), ('claude', 'sonnet', 'medium'))
+        self.assertEqual(lg.parse_single('agy/gemini-4-neon:medium'), ('agy', 'gemini-4-neon', 'medium'))
+        cues = lg.speech_cues(lg.parse_srt(self.srt))
+        a = lg.Store(cues, 'sonnet', 'medium', provider='claude')
+        b = lg.Store(cues, 'gemini-4-neon', 'medium', provider='agy')
+        for c in cues:
+            a.put(c.id, [f'claude {c.id}'])
+            b.put(c.id, [f'google {c.id}'])
+        a.save()
+        b.save()
+        out, key = self.dir / 'cega.md', self.dir / 'chave.json'
+        args = SimpleNamespace(input=str(self.srt), reference=str(self.srt),
+                               variant=['sonnet:medium', 'agy/gemini-4-neon:medium'],
+                               sample=5, exclude=None, out=str(out), key=str(key))
+        self.assertEqual(lg.cmd_blind(args), 0)
+        self.assertEqual(len(json.loads(key.read_text(encoding='utf-8'))), 3)
 
 
 if __name__ == '__main__':

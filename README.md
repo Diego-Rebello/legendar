@@ -1,6 +1,6 @@
 # legendar
 
-Gera legendas em português do Brasil para vídeos MKV que só têm legenda em inglês, traduzindo com o Claude pela sua assinatura, sem chave de API.
+Gera legendas em português do Brasil para vídeos MKV que só têm legenda em inglês, traduzindo pela sua assinatura do Claude (`claude`) ou pela conta Google (`agy`), sem chave de API.
 
 O vídeo original não é alterado. O resultado é um arquivo `<nome do vídeo>.pt-BR.srt` ao lado dele, que o VLC e outros players carregam como legenda. Feito e testado para uso pessoal no macOS.
 
@@ -10,7 +10,7 @@ A legenda final só leva fala: efeitos, sons, música, letras de música e nomes
 
 - **Python 3**
 - **[MKVToolNix](https://mkvtoolnix.download/)**, com `mkvmerge` e `mkvextract` no `PATH`: `brew install mkvtoolnix`
-- **Claude Code** (`claude`) com login em uma conta de assinatura. O programa para se `claude auth status` não mostrar `authMethod: claude.ai`, e nunca usa `ANTHROPIC_API_KEY`.
+- **Claude Code** (`claude`) com login em uma conta de assinatura (o programa para se `claude auth status` não mostrar `authMethod: claude.ai`, e nunca usa `ANTHROPIC_API_KEY`) **e/ou Antigravity CLI** (`agy`) autenticado na sua conta Google (nunca usa `GEMINI_API_KEY`/`GOOGLE_API_KEY` nem créditos extras pagos).
 - **Command Line Tools do Xcode**, só para compilar o app: `xcode-select --install`
 
 O MKV precisa de uma trilha de legenda em texto (SRT) marcada como inglês. Legendas em imagem, como PGS, não são aceitas.
@@ -24,7 +24,7 @@ gui/build.sh
 open Legendar.app
 ```
 
-Arraste o MKV para a janela. Isso só analisa o arquivo, sem gastar limite. A tradução começa quando você clica em **Traduzir**.
+Escolha a conta no topo da janela (**Claude (Sonnet)** ou **Google (Gemini 4 Hydrogen)**) e arraste o MKV. Isso só analisa o arquivo, sem gastar limite. A tradução começa quando você clica em **Traduzir**.
 
 O app guarda o caminho do projeto: se mover a pasta, rode `gui/build.sh` de novo.
 
@@ -36,10 +36,11 @@ Confira primeiro o que seria feito, sem chamar o modelo:
 python3 -I scripts/legendar.py run "/caminho/do/video.mkv" --effort medium --dry-run
 ```
 
-Depois, traduza o arquivo inteiro:
+Depois, traduza o arquivo inteiro (Claude é o padrão; para conta Google, passe `--provider agy`):
 
 ```sh
 python3 -I scripts/legendar.py run "/caminho/do/video.mkv" --effort medium --max-blocks 9999
+python3 -I scripts/legendar.py run "/caminho/do/video.mkv" --provider agy --effort medium --max-blocks 9999
 ```
 
 O padrão de `--max-blocks` é 1, para que gastar limite seja sempre uma decisão explícita. Sem ele, só o primeiro bloco é traduzido, e o SRT só é gerado quando todas as legendas estiverem prontas. A entrada também pode ser um arquivo `.srt` em inglês.

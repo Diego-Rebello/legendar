@@ -6,7 +6,7 @@ Gera legendas em pt-BR para vídeos MKV que só têm legenda em inglês. Uso pes
 
 - **Saída padrão:** `<nome do vídeo>.pt-BR.srt` ao lado do vídeo. O vídeo original nunca é alterado.
 - **`--embed` (opcional, ainda não implementado):** gera MKV novo com a trilha pt-BR. Só substitui o original depois de comparar as trilhas byte a byte, e manda o antigo para a Lixeira.
-- **Sem API paga.** Toda chamada de modelo usa `claude -p` com os limites da assinatura (plano Pro). Não usar SDK, Batch API nem `ANTHROPIC_API_KEY`.
+- **Sem API paga.** Toda chamada de modelo usa `claude -p` (assinatura Claude, padrão: `sonnet:medium`) ou `agy -p` (conta Google via Antigravity CLI, padrão: `gemini-4-hydrogen:medium`, com `modelProvider: ""` e `useG1Credits: false`). Não usar SDK, Batch API nem chaves de API (`ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`).
 - **Etapas sem LLM ficam em script.** Só tradução, glossário e revisão consomem limite.
 - **A saída só leva fala.** Sem efeitos, sons, música, letras de música nem nome de quem fala. A remoção é local e acontece antes do modelo.
 

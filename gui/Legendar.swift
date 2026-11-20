@@ -2,6 +2,41 @@
 // Compilar com gui/build.sh.
 import SwiftUI
 
+enum Backend: String, CaseIterable, Identifiable {
+    case claude
+    case agy
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .claude: return "Claude (Sonnet)"
+        case .agy: return "Google (Gemini 4 Hydrogen)"
+        }
+    }
+
+    var modelName: String {
+        switch self {
+        case .claude: return "Sonnet"
+        case .agy: return "Gemini 4 Hydrogen"
+        }
+    }
+
+    var cliArgs: [String] {
+        switch self {
+        case .claude: return ["--provider", "claude", "--model", "sonnet", "--effort", "medium"]
+        case .agy: return ["--provider", "agy", "--model", "gemini-4-hydrogen", "--effort", "medium"]
+        }
+    }
+
+    var idleText: String {
+        switch self {
+        case .claude: return "Sonnet em esforço médio, pela assinatura do Claude. Nada vai ao modelo antes da sua confirmação."
+        case .agy: return "Gemini 4 Hydrogen em esforço médio, pela conta Google (agy). Nada vai ao modelo antes da sua confirmação."
+        }
+    }
+}
+
 struct Step: Identifiable {
     enum State { case pending, active, done, failed }
 
@@ -14,7 +49,6 @@ struct Step: Identifiable {
 
 final class Job: ObservableObject {
     static let shared = Job()
-    private static let names = ["Extrair a legenda em inglês", "Remover efeitos, sons, música e nomes", "Traduzir com o Sonnet", "Gravar o SRT"]
     private static let extract = 0, clean = 1, translate = 2, write = 3
 
     enum Phase: Equatable {
@@ -26,10 +60,11 @@ final class Job: ObservableObject {
         case failed(String)
     }
 
+    @Published private(set) var backend = Backend.claude
     @Published private(set) var phase = Phase.idle
     @Published private(set) var video: URL?
     @Published private(set) var log = ""
-    @Published private(set) var steps = Job.freshSteps()
+    @Published private(set) var steps = Job.freshSteps(for: .claude)
     @Published private(set) var callStart: Date?
     @Published private(set) var refused = 0
     @Published private(set) var existingOutput: String?
@@ -42,8 +77,19 @@ final class Job: ObservableObject {
     private var generated: URL?
     private var cancelled = false
 
-    private static func freshSteps() -> [Step] {
-        names.enumerated().map { Step(id: $0.offset, name: $0.element) }
+    private static func freshSteps(for backend: Backend) -> [Step] {
+        let names = ["Extrair a legenda em inglês", "Remover efeitos, sons, música e nomes", "Traduzir com o \(backend.modelName)", "Gravar o SRT"]
+        return names.enumerated().map { Step(id: $0.offset, name: $0.element) }
+    }
+
+    func select(_ next: Backend) {
+        guard !busy, next != backend else { return }
+        backend = next
+        if video != nil {
+            check()
+        } else {
+            steps = Job.freshSteps(for: next)
+        }
     }
 
     var busy: Bool { phase == .checking || phase == .running }
@@ -77,7 +123,7 @@ final class Job: ObservableObject {
         existingOutput = nil
         notice = nil
         log = ""
-        steps = Job.freshSteps()
+        steps = Job.freshSteps(for: backend)
         steps[Job.extract].state = .active
         phase = .checking
         launch(["--dry-run"]) { status in
@@ -143,8 +189,8 @@ final class Job: ObservableObject {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         // -u: sem ele, a saída só chegaria aqui no fim da rodada. -I vem do CLAUDE.md, -X utf8 é para o Finder, sem LANG.
-        p.arguments = ["python3", "-I", "-u", "-X", "utf8", "\(root)/scripts/legendar.py", "run", video!.path,
-                       "--model", "sonnet", "--effort", "medium", "--max-blocks", "9999"] + extra
+        p.arguments = ["python3", "-I", "-u", "-X", "utf8", "\(root)/scripts/legendar.py", "run", video!.path]
+            + backend.cliArgs + ["--max-blocks", "9999"] + extra
         p.currentDirectoryURL = URL(fileURLWithPath: root)
         p.environment = env
         p.standardOutput = pipe
@@ -274,6 +320,7 @@ struct ContentView: View {
 
     var body: some View {
         VStack(spacing: 14) {
+            backendPicker
             dropZone
             stepList
             if let notice = job.notice {
@@ -284,8 +331,17 @@ struct ContentView: View {
             logView
         }
         .padding(18)
-        .frame(minWidth: 620, minHeight: 620)
+        .frame(minWidth: 620, minHeight: 650)
         .onOpenURL { _ = job.receive([$0]) }
+    }
+
+    private var backendPicker: some View {
+        Picker("Conta", selection: Binding(get: { job.backend }, set: { job.select($0) })) {
+            ForEach(Backend.allCases) { Text($0.label).tag($0) }
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .disabled(job.busy)
     }
 
     private var dropZone: some View {
@@ -321,17 +377,17 @@ struct ContentView: View {
     @ViewBuilder private var status: some View {
         switch job.phase {
         case .idle:
-            Text("Sonnet em esforço médio, pela assinatura. Nada vai ao modelo antes da sua confirmação.")
+            Text(job.backend.idleText)
                 .foregroundStyle(.secondary)
         case .checking, .running:
             EmptyView()
         case .ready(let calls):
             VStack(spacing: 4) {
                 if job.retrying {
-                    Text("O modelo recusou \(job.refused) legendas, e sem elas não há SRT. Tentar de novo: \(calls) chamada(s) ao Sonnet, que gastam limite do plano.")
+                    Text("O modelo recusou \(job.refused) legendas, e sem elas não há SRT. Tentar de novo: \(calls) chamada(s) ao \(job.backend.modelName), que gastam limite do plano.")
                         .multilineTextAlignment(.center)
                 } else {
-                    Text(calls == 0 ? "Tudo em cache: nenhuma chamada ao modelo." : "Falta confirmar: \(calls) chamada(s) ao Sonnet, que gastam limite do plano.")
+                    Text(calls == 0 ? "Tudo em cache: nenhuma chamada ao modelo." : "Falta confirmar: \(calls) chamada(s) ao \(job.backend.modelName), que gastam limite do plano.")
                     if job.refused > 0 {
                         Text("O modelo recusou \(job.refused) legendas, que ficam para depois: sem elas não há SRT.").foregroundStyle(.orange)
                     }
